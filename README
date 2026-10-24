@@ -58,6 +58,47 @@ there are extensions for:
       You won't be able to use these extensions if you do not patch and
       recompile respective the LISP definitions as well.
 
-to install follow the instructions given in the file INSTALL.
+To build on x86_64 Linux, install GCC, CMake 3.20 or newer, Make or Ninja,
+and the development headers and libraries for X11 (including Xlib-xcb) and
+libcrypt. Then run:
 
-./configure --help will give you some configuration options
+    cmake -S . -B build
+    cmake --build build --parallel
+    ctest --test-dir build --output-on-failure
+
+The executables are build/src/genera and build/src/byteswap_world. Use
+./build/src/genera in your existing world-launch command. CMake selects
+GNU C99 explicitly because the code uses a word-sized bool typedef and
+function declarations that are incompatible with C23. Build products stay
+inside the build directory.
+
+The default Release build preserves -Ofast and -march=native. Use
+-DCMAKE_BUILD_TYPE=Debug for debugging, -DVLM_FAST=OFF for -O2 in Release,
+or -DVLM_NATIVE=OFF to build for other x86_64 CPUs. See INSTALL for all options.
+
+CLISP is optional when using the checked-in interpreter sources. To regenerate
+them from the Alpha assembler and Lisp macros, configure with
+-DVLM_REGENERATE_STUBS=ON. Generated C files go into build/stub and are rebuilt
+when their inputs change; the checked-in copies are not overwritten.
+
+To check shutdown with a real world, prefix your normal ./build/src/genera command
+with "python3 tests/shutdown.py --". This requires a working X display and TAP
+interface, and starts four temporary instances to check declining and confirming
+exit for SIGINT, SIGTERM, SIGHUP, and SIGQUIT.
+
+If startup reports "Unable to set calendar clock" after you enter the date,
+leave TIME:SET-CALENDAR-CLOCK as the debugger's current frame and press Ctrl-R.
+At "Return from TIME:SET-CALENDAR-CLOCK? (Y or N)", type Y. The caller does
+not need a return value; this skips the failed clock-setting call and lets
+initialization continue. Abort would instead exit the initialization process.
+
+Older worlds reject modern years from the host clock. Once Genera can access
+the repository files (for example through NFS), load OG2-patches/use-host-time.lisp
+inside Genera. This repairs the year decoding/validation and enables startup
+from the host clock. Evaluate (time:initialize-timebase) to use it immediately,
+then save a new world to retain the patch for subsequent boots. Rebuilding
+the emulator alone does not install Lisp patches into an existing world.
+
+To install, follow the instructions given in the file INSTALL.
+
+cmake -LAH -N build lists the configuration options for an existing build.

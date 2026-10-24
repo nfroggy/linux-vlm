@@ -161,6 +161,7 @@
   "-*- Mode:LISP; Package:TIME; Base:8 -*-")
 
 
-(DEFVAR *INITIALIZE-TIMEBASE-FROM-CALENDAR-CLOCK* t
-  "Skip trying to read from network or prompting user")
+;; The world already defines this variable.  DEFVAR would leave an existing
+;; NIL value unchanged, so loading the patch must explicitly enable it.
+(SETQ *INITIALIZE-TIMEBASE-FROM-CALENDAR-CLOCK* t)
 

@@ -171,7 +171,7 @@ extern inline u64 _SUBS(int rd, int ra, u64 a, int rb, u64 b);
 extern inline u64 _MULS(int rd, int ra, u64 a, int rb, u64 b);
 extern inline u64 _DIVS(int rd, int ra, u64 a, int rb, u64 b);
 
-inline u64 CMPBGE(u64 a, u64 b)
+static inline u64 CMPBGE(u64 a, u64 b)
 {
   u64 res = 0;
   u8 aa, bb;
@@ -682,32 +682,33 @@ processor->stop_interpreter = 0;
 #endif
   return r1;
 
-#include "ifunhead.c"
-#include "idispat.c"
-#include "ifuncom1.c"
-#include "ifuncom2.c"
-#include "ifungene.c"
-#include "ifunfcal.c"
-#include "ifunloop.c"
-#include "ifunlist.c"
-#include "ifuninst.c"
-#include "ifunmath.c"
-#include "ifunarra.c"
-#include "ifunmove.c"
-#include "ifunpred.c"
-#include "ifunsubp.c"
-#include "ifunfext.c"
-#include "ifunlexi.c"
-#include "ifunbits.c"
-#include "ifunblok.c"
-#include "ifunbind.c"
-#include "ifunfull.c"
-#include "ifunbnum.c"
-#include "ifuntrap.c"
-#include "ihalt.c"
-#include "idouble.c"
-#include "ifunjosh.c"
-#include "ifuntran.c"
+/* Search the build include path first when regenerating these sources. */
+#include <ifunhead.c>
+#include <idispat.c>
+#include <ifuncom1.c>
+#include <ifuncom2.c>
+#include <ifungene.c>
+#include <ifunfcal.c>
+#include <ifunloop.c>
+#include <ifunlist.c>
+#include <ifuninst.c>
+#include <ifunmath.c>
+#include <ifunarra.c>
+#include <ifunmove.c>
+#include <ifunpred.c>
+#include <ifunsubp.c>
+#include <ifunfext.c>
+#include <ifunlexi.c>
+#include <ifunbits.c>
+#include <ifunblok.c>
+#include <ifunbind.c>
+#include <ifunfull.c>
+#include <ifunbnum.c>
+#include <ifuntrap.c>
+#include <ihalt.c>
+#include <idouble.c>
+#include <ifunjosh.c>
+#include <ifuntran.c>
 }
 
 void SpinWheels () {

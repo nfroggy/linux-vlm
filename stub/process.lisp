@@ -2212,7 +2212,11 @@
  		  "ifunjosh" "ifuntran"))
     (progn
 ;      (setq count (+ 1 count))
-      (setq outputfilename (format nil "~A.c" file))
+      ;; CMake supplies a build directory, leaving checked-in sources untouched.
+      ;; Without it, preserve the standalone "clisp process.lisp" behavior.
+      (setq outputfilename
+            (merge-pathnames (format nil "~A.c" file)
+                             (or (ext:getenv "VLM_STUB_OUTPUT_DIRECTORY") "")))
       (setq inputfilename (format nil "../alpha-emulator/~A.as" file))
       (format t "compiling ~A~8,11T" inputfilename)
       (format t "--> ~A~%" outputfilename)

@@ -717,7 +717,6 @@ void HaltMachine (void)
 {
   if (Runningp()) {
     processor->please_stop=HaltReason_SpyCalled;
-printf("HaltMachine!!!\n");
     processor->stop_interpreter=1;
   }
 }

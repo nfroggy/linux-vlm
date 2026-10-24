@@ -445,11 +445,25 @@ int  InitializeLifeSupport (VLMConfig* config)
 
 void TerminateLifeSupport ()
 {
-  struct timespec killSleep;
   void* exit_code;
 
 	if (NULL == pthread_getspecific (mainThread))
 		return;
+
+	/* Stop producers before tearing down channels and the locks/signals they use. */
+	if (EmbCommAreaPtr->pollingThreadSetup)
+	  {
+		pthread_cancel (EmbCommAreaPtr->pollingThread);
+		pthread_join (EmbCommAreaPtr->pollingThread, &exit_code);
+		EmbCommAreaPtr->pollingThreadSetup = FALSE;
+	  }
+
+	if (EmbCommAreaPtr->clockThreadSetup)
+	  {
+		pthread_cancel (EmbCommAreaPtr->clockThread);
+		pthread_join (EmbCommAreaPtr->clockThread, &exit_code);
+		EmbCommAreaPtr->clockThreadSetup = FALSE;
+	  }
 	/*
 	 * JJ: terminate network first
 	 */
@@ -469,10 +483,6 @@ void TerminateLifeSupport ()
 	 */
 	/* TerminateNetworkChannels (); */
 
-	killSleep.tv_sec = 1;
-	killSleep.tv_nsec = 250000000;
-	pthread_delay_np (&killSleep);
-
 	if (EmbCommAreaPtr->wakeupSignalSetup)
 	  {
 		pthread_cond_destroy (&EmbCommAreaPtr->wakeupSignal);
@@ -491,13 +501,6 @@ void TerminateLifeSupport ()
 		EmbCommAreaPtr->XLockSetup = FALSE;
 	  }
 
-	if (EmbCommAreaPtr->clockThreadSetup)
-	  {
-		pthread_cancel (EmbCommAreaPtr->clockThread);
-		pthread_join (EmbCommAreaPtr->clockThread, &exit_code);
-		EmbCommAreaPtr->clockThreadSetup = FALSE;
-	  }
-
 	if (EmbCommAreaPtr->clockSignalSetup)
 	  {
 		pthread_cond_destroy (&EmbCommAreaPtr->clockSignal);
@@ -508,13 +511,6 @@ void TerminateLifeSupport ()
 	  {
 		pthread_mutex_destroy (&EmbCommAreaPtr->clockLock);
 		EmbCommAreaPtr->clockLockSetup = FALSE;
-	  }
-
-	if (EmbCommAreaPtr->pollingThreadSetup)
-	  {
-		pthread_cancel (EmbCommAreaPtr->pollingThread);
-		pthread_join (EmbCommAreaPtr->pollingThread, &exit_code);
-		EmbCommAreaPtr->pollingThreadSetup = FALSE;
 	  }
 
 	if (EmbCommAreaPtr->signalSignalSetup)

@@ -28,9 +28,77 @@
 Boolean Trace = FALSE;
 Boolean EnableIDS = FALSE;
 Boolean TestFunction = FALSE;
-static pthread_key_t mainThread;
+static sigset_t terminationSignals;
+static pthread_t terminationThread;
+static Boolean terminationThreadSetup = FALSE;
+static pthread_mutex_t terminationLock = PTHREAD_MUTEX_INITIALIZER;
+static Boolean terminationRequested = FALSE;
 
-static void MaybeTerminateVLM (int signal)
+/* Block these signals before creating workers so sigwait receives them all.
+   Cleanup must never run in a handler interrupting a mutex or condition wait. */
+static void BlockTerminationSignals (void)
+{
+  sigemptyset (&terminationSignals);
+  sigaddset (&terminationSignals, SIGINT);
+  sigaddset (&terminationSignals, SIGTERM);
+  sigaddset (&terminationSignals, SIGHUP);
+  sigaddset (&terminationSignals, SIGQUIT);
+  if (pthread_sigmask (SIG_BLOCK, &terminationSignals, NULL))
+    vpunt (NULL, "Unable to block termination signals.");
+}
+
+static void* WaitForTermination (void* argument)
+{
+  int signal, oldCancelState;
+
+  while (TRUE)
+    {
+      if (sigwait (&terminationSignals, &signal))
+        vpunt (NULL, "Unable to wait for termination signals.");
+
+      /* Publish the request and halt together. The main thread handles the
+         prompt only after the interpreter has returned and released its locks. */
+      pthread_setcancelstate (PTHREAD_CANCEL_DISABLE, &oldCancelState);
+      pthread_mutex_lock (&terminationLock);
+      terminationRequested = TRUE;
+      HaltMachine ();
+      pthread_mutex_unlock (&terminationLock);
+      pthread_setcancelstate (oldCancelState, NULL);
+    }
+  return NULL;
+}
+
+static void StopTerminationThread (void)
+{
+  if (terminationThreadSetup)
+    {
+      pthread_cancel (terminationThread);
+      pthread_join (terminationThread, NULL);
+      terminationThreadSetup = FALSE;
+    }
+}
+
+static void StartTerminationThread (void)
+{
+  if (pthread_create (&terminationThread, NULL, WaitForTermination, NULL))
+    vpunt (NULL, "Unable to create the termination signal thread.");
+  terminationThreadSetup = TRUE;
+  if (atexit (StopTerminationThread))
+    vpunt (NULL, "Unable to establish termination signal cleanup.");
+}
+
+static Boolean TakeTerminationRequest (void)
+{
+  Boolean requested;
+
+  pthread_mutex_lock (&terminationLock);
+  requested = terminationRequested;
+  terminationRequested = FALSE;
+  pthread_mutex_unlock (&terminationLock);
+  return requested;
+}
+
+static void MaybeTerminateVLM (void)
 {
 #ifdef OS_LINUX
   char *answer = NULL;
@@ -39,9 +107,6 @@ static void MaybeTerminateVLM (int signal)
 #else
   char answer[BUFSIZ];
 #endif
-
-  if (NULL == pthread_getspecific (mainThread))
-    return;
 
   if (EmbCommAreaPtr->guestStatus > StartedGuestStatus)
     {
@@ -63,8 +128,12 @@ static void MaybeTerminateVLM (int signal)
 #ifdef OS_LINUX
           nRead = getline (&answer, answerSize_p, stdin);
           if (nRead < 0)
-            vpunt (NULL, "Unexpected EOF on standard input");
-          answer[nRead - 1] = '\0';
+            {
+              free (answer);
+              vpunt (NULL, "Unexpected EOF on standard input");
+            }
+          if (nRead > 0 && answer[nRead - 1] == '\n')
+            answer[nRead - 1] = '\0';
 #else
           if (NULL == gets (answer))
             vpunt (NULL, "Unexpected EOF on standard input");
@@ -72,15 +141,24 @@ static void MaybeTerminateVLM (int signal)
           if (0 == strcmp (answer, "yes"))
             break;
           else if (0 == strcmp (answer, "no"))
-            return;
+            {
+#ifdef OS_LINUX
+              free (answer);
+#endif
+              return;
+            }
           else
             {
               fprintf (stderr, "Please answer 'yes' or 'no'.  ");
               fflush (stderr);
             }
         }
+#ifdef OS_LINUX
+      free (answer);
+#endif
     }
 
+  StopTerminationThread ();
   TerminateTracing ();
   TerminateSpy ();
   TerminateLifeSupport ();
@@ -92,11 +170,11 @@ static void MaybeTerminateVLM (int signal)
 int main (int argc, char** argv)
 {
   VLMConfig config;
-  struct sigaction sigAction;
   Integer worldImageSize, worldImageMB;
   char* message;
-  int reason;
+  int reason = 0;
 
+  BlockTerminationSignals ();
   BuildConfiguration (&config, argc, argv);
 #ifdef GENERA
   EnableIDS = config.enableIDS;
@@ -130,22 +208,7 @@ int main (int argc, char** argv)
   /* TBD: -- Need an equivalent to: fesetenv (FE_NOMASK_ENV) */
 #endif
 
-  if (pthread_key_create (&mainThread, NULL))
-    vpunt (NULL, "Unable to establish per-thread data.");
-
-  pthread_setspecific (mainThread, (void*) TRUE);
-
-  sigAction.sa_handler = (sa_handler_t)MaybeTerminateVLM;
-  sigemptyset (&sigAction.sa_mask);
-  sigAction.sa_flags = 0;
-  if (sigaction (SIGINT, &sigAction, NULL))
-    vpunt (NULL, "Unable to establish SIGINT handler.");
-  if (sigaction (SIGTERM, &sigAction, NULL))
-    vpunt (NULL, "Unable to establish SIGTERM handler.");
-  if (sigaction (SIGHUP, &sigAction, NULL))
-    vpunt (NULL, "Unable to establish SIGHUP handler.");
-  if (sigaction (SIGQUIT, &sigAction, NULL))
-    vpunt (NULL, "Unable to establish SIGQUIT handler.");
+  StartTerminationThread ();
 
 #ifdef IVERIFY
   EnsureVirtualAddressRange (0xF8000000L, 0x00100000L, FALSE);
@@ -180,8 +243,22 @@ int main (int argc, char** argv)
 
   if (config.enableSpy) ReleaseSpyLock ();
 
-  while (config.enableSpy ? TRUE : Runningp())
+  while (TRUE)
     {
+      if (TakeTerminationRequest ())
+        {
+          MaybeTerminateVLM ();
+          /* A declined exit resumes from the state saved by the interpreter. */
+          if (HaltReason_SpyCalled == reason)
+            StartMachine (TRUE);
+        }
+#ifndef IVERIFY
+      if (HaltReason_Halted == reason)
+        break;
+#endif
+      if (!config.enableSpy && !Runningp ())
+        break;
+
       reason = InstructionSequencer ();
       if (reason)     
         {
@@ -214,10 +291,6 @@ int main (int argc, char** argv)
             vwarn (NULL, "%s at PC %08x (%s)", message, processor->epc >> 1,
                    (processor->epc & 1) ? "Odd" : "Even");
         }
-#ifndef IVERIFY
-      if (HaltReason_Halted == reason)
-        break;
-#endif
     }
 
   exit (EXIT_SUCCESS);
