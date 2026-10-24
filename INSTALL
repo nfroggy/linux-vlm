@@ -3,7 +3,8 @@ Building and installing the Linux VLM
 
 Requirements: x86_64 Linux, GCC, CMake 3.20 or newer, Make or Ninja, pthreads,
 libm, libdl, and development headers/libraries for X11, Xlib-xcb, and libcrypt.
-CLISP is needed only when regenerating the interpreter sources.
+The default interpreter is the direct C Ivory engine. CLISP is needed only
+when regenerating the optional legacy Alpha interpreter sources.
 
 Configure, build, and test:
 
@@ -30,7 +31,8 @@ Configuration options (pass -DNAME=VALUE to cmake -S . -B build):
 
     CMAKE_BUILD_TYPE          Release (default), Debug, RelWithDebInfo,
                              or MinSizeRel for single-configuration generators
-    BUILD_TESTING            ON by default; builds the floating-point test
+    BUILD_TESTING            ON by default; builds the Ivory instruction tests
+    VLM_C_ENGINE             ON: direct C Ivory; OFF: generated Alpha interpreter
     VLM_FAST                 ON: -Ofast in Release/RelWithDebInfo; OFF: -O2
     VLM_NATIVE               ON: -march=native; OFF: generic x86_64 code
     VLM_AUTOSTART            ON: boot the Genera world automatically
@@ -46,12 +48,16 @@ Configuration options (pass -DNAME=VALUE to cmake -S . -B build):
 
 Protocol debugging requires VLM_DEBUG_NETWORK=ON. Debug builds use CMake's
 normal debug flags; VLM_FAST affects only Release and RelWithDebInfo.
+The C engine always uses strict floating-point semantics, even with VLM_FAST=ON.
 VLM_NATIVE=OFF is useful when distributing binaries to other x86_64 machines.
 GNU C99 and -fno-strict-aliasing are required by the existing emulator code.
 
+To switch an existing build to the C engine, explicitly pass -DVLM_C_ENGINE=ON
+when configuring it. CMake preserves previously cached option values.
+
 To develop the interpreter's assembler or Lisp macros:
 
-    cmake -S . -B build -DVLM_REGENERATE_STUBS=ON
+    cmake -S . -B build -DVLM_C_ENGINE=OFF -DVLM_REGENERATE_STUBS=ON
     cmake --build build --parallel
 
 CMake runs CLISP when the inputs change and puts generated instruction sources

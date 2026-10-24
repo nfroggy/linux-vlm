@@ -37,6 +37,7 @@ typedef unsigned char VMAttribute;
 
 extern Boolean EnableIDS;
 extern VMAttribute VMAttributeTable[1<<(32-MemoryPage_AddressShift)];
+void RecordVirtualMemoryWrite(Integer vma);
 
 #define VMAccessFault(a) ((a)&VMAttribute_AccessFault)
 #define VMWriteFault(a) ((a)&VMAttribute_WriteFault)

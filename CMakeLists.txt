@@ -10,7 +10,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
     message(FATAL_ERROR "This build supports 64-bit x86 Linux.")
 endif()
 if(NOT CMAKE_C_COMPILER_ID STREQUAL "GNU")
-    message(FATAL_ERROR "The generated interpreter requires GCC. Configure with -DCMAKE_C_COMPILER=gcc.")
+    message(FATAL_ERROR "This build requires GCC. Configure with -DCMAKE_C_COMPILER=gcc.")
 endif()
 
 # C23 changes both bool and old-style function declarations used by the VLM.
@@ -32,7 +32,11 @@ option(VLM_DEBUG_NETWORK "Enable network debugging" OFF)
 foreach(protocol IP CHAOS ARP ICMP)
     option(VLM_DEBUG_NETWORK_${protocol} "Enable ${protocol} network debugging" OFF)
 endforeach()
+option(VLM_C_ENGINE "Use the direct C Ivory interpreter" ON)
 option(VLM_REGENERATE_STUBS "Regenerate interpreter sources with CLISP" OFF)
+if(VLM_C_ENGINE AND VLM_REGENERATE_STUBS)
+    message(FATAL_ERROR "VLM_REGENERATE_STUBS requires -DVLM_C_ENGINE=OFF.")
+endif()
 
 include(cmake/Dependencies.cmake)
 include(GNUInstallDirs)
@@ -93,5 +97,10 @@ target_link_libraries(vlm_options INTERFACE
 
 add_subdirectory(emulator)
 add_subdirectory(life-support)
-add_subdirectory(stub)
+if(VLM_C_ENGINE)
+    target_compile_definitions(vlm_options INTERFACE VLM_C_ENGINE TRACING)
+    add_subdirectory(c-emulator)
+else()
+    add_subdirectory(stub)
+endif()
 add_subdirectory(src)

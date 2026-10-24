@@ -69,6 +69,8 @@ extern void segv_handler (int sigval, siginfo_t *si, void *uc);
 extern void segv_handler (int sigval, siginfo_t *si, void *uc);
 #endif
 
+
+#ifndef VLM_C_ENGINE
 extern void DoIStageError();
 /* Just jam the PC to DoIStageError, which will "do the right thing"!!! */
 #if defined(OS_OSF)
@@ -148,6 +150,8 @@ void fpe_handler (int sigval, siginfo_t *si, void *uc)
 }
 #endif
 
+#endif /* !VLM_C_ENGINE */
+
 int InstructionSequencer (void)
 { struct timespec interpreterSleep;
   interpreterSleep.tv_sec = 0;
@@ -167,6 +171,7 @@ int InstructionSequencer (void)
     if (-1 == sigaction(SIGSEGV, &action, NULL))
       vpunt (NULL, "Unable to establish memory fault handler.");
 
+#ifndef VLM_C_ENGINE
 #ifdef OS_OSF
     action.sa_handler = (sa_handler_t)fpe_handler;
     action.sa_flags = 0;
@@ -189,6 +194,7 @@ int InstructionSequencer (void)
     if (-1 == sigaction(SIGILL, &action, NULL))
       vpunt (NULL, "Unable to establish floating point exception handler");
 
+#endif
     reason=iInterpret((PROCESSORSTATEP)MapVirtualAddressTag(0));
     processor->please_stop=0;
     processor->please_trap=0;			/* ????? */
@@ -360,6 +366,10 @@ void CheckMat ()
 
 #if defined(ARCH_ALPHA)
 static void ComputeSpeed (int64_t *speed) {
+#ifdef VLM_C_ENGINE
+  *speed = 0;
+  return;
+#else
   extern void SpinWheels ();
   struct tms tms;
   int timebefore, timeafter, t1, tmin=0x7FFFFFFF, i;
@@ -375,6 +385,7 @@ static void ComputeSpeed (int64_t *speed) {
   };
   *speed=((((int64_t) tmin)*1000000L)/0x4000000L);
   processor->mscmultiplier=(*speed<<24)/1000000;
+#endif
 }
 
 #elif defined(ARCH_PPC64)
@@ -406,6 +417,10 @@ static void ComputeSpeed (int64_t *speed) {
 }
 #elif defined(ARCH_X86_64)
 static void ComputeSpeed (int64_t *speed) {
+#ifdef VLM_C_ENGINE
+  *speed = 0;
+  return;
+#else
   extern void SpinWheels ();
   struct tms tms;
   int timebefore, timeafter, t1, tmin=0x7FFFFFFF, i;
@@ -421,6 +436,7 @@ static void ComputeSpeed (int64_t *speed) {
   };
   *speed=((((int64_t) tmin)*1000000L)/0x4000000L);
   processor->mscmultiplier=(*speed<<24)/1000000;
+#endif
 }
 #endif
 
@@ -572,7 +588,7 @@ void InitializeIvoryProcessor (Integer *basedata, Tag *basetag)
 	/* VLM does not use transport bits, clear from table to save a cycle */
 	for (e = &MemoryActionTable[i][0],j=0 ; e < &MemoryActionTable[i][64]; e++, j++) {
 	  *e &= ~MemoryAction_Transport;
-          if (*e) mask |= (1L << j); /* accumulate mask of types with action */
+          if (*e) mask |= (UINT64_C(1) << j); /* accumulate mask of types with action */
 	  matline[j]=*e; /* copy bits into copymat */
         }
         *maskPointer = mask;
@@ -588,31 +604,37 @@ void InitializeIvoryProcessor (Integer *basedata, Tag *basetag)
     processor->eqnoteql=(uint64_t)0x000000000000F800L;
 
     /* The 32 bit value of most positive and most negative fixnum */
-    processor->mostpositivefixnum=(int64_t)((~(-1 << 31)) & 0xFFFFFFFF);
-    processor->mostnegativefixnum=(int64_t)(( (-1 << 31)) & 0xFFFFFFFF);
+    processor->mostpositivefixnum=INT32_MAX;
+    processor->mostnegativefixnum=UINT32_C(0x80000000);
 
+#ifndef VLM_C_ENGINE
     processor->halfworddispatch=(int64_t)halfworddispatch;
     processor->fullworddispatch=(int64_t)fullworddispatch;
     processor->internalregisterread1=(int64_t)internalregisterread1;
     processor->internalregisterread2=(int64_t)internalregisterread2;
     processor->internalregisterwrite1=(int64_t)internalregisterwrite1;
     processor->internalregisterwrite2=(int64_t)internalregisterwrite2;
+#endif
     processor->extraandcatch=(1L<<8 | 1L<<26);
     processor->fccrmask= ~(0x074FFFFFL);
     processor->fccrtrapmask= (processor->fccrmask)&~(7L<<27);
     processor->coprocessorreadhook=(char*)&CoprocessorRead;
     processor->coprocessorwritehook=(char*)&CoprocessorWrite;
     processor->trace_hook = 0;			/* Don't trace the self-test ... */
+#ifndef VLM_C_ENGINE
     processor->i_stage_error_hook=(char*)&DoIStageError;
+#endif
     processor->flushcaches_hook=(char*)&FlushCaches;
     processor->statistics=(char *)malloc(0x2000*sizeof(int64_t));
 
     /* Add the native code callout trampolines */
+#ifndef VLM_C_ENGINE
     processor->resumeema=(int64_t)(&resumeemulated);
     processor->carsubroutine=(int64_t)(&CarSubroutine);
     processor->cdrsubroutine=(int64_t)(&CdrSubroutine);
     processor->carcdrsubroutine=(int64_t)(&CarCdrSubroutine);
 
+#endif
     InitializeStatistics();
   }
 

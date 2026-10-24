@@ -271,13 +271,13 @@ const ExceptionInfo InstructionExceptionInfo[0400] = {
   {0,      True,         False},       /* %HACK */
   };
 
-static int FetchTrapVectorEntry (Integer index, LispObj* entry)
+static int FetchTrapVectorEntry (Integer index, CObject* entry)
 {
-  register ProcessorState *ps = processor;
+  register CProcessorState *ps = c_processor;
   int previous = ReadControlTrapMode(ps->control);
 
   WriteControlTrapMode(ps->control, 3);
-  MemoryReadData(TrapVectorBase + ((previous<3)?index:FepModeTrapVector), entry);
+  MemoryReadData(previous < 3 ? TrapVectorBase + index : ps->FEPModeTrapVectorAddress, entry);
   if (!(TypeEqualP(entry->TAG,TypeOddPC) || TypeEqualP(entry->TAG,TypeEvenPC)))
     if (previous == 3 || !FetchTrapVectorEntry(index, entry))
       return(0);		/* Real hardware would RESET */
@@ -286,16 +286,15 @@ static int FetchTrapVectorEntry (Integer index, LispObj* entry)
   return(1);
 }
 
-int TakePreTrap (Integer index, LispObj* extra1, LispObj* extra2)
+int TakePreTrap (Integer index, CObject* extra1, CObject* extra2)
 {
-  register ProcessorState *ps = processor;
-  LispObj* oldfp = ps->fp;
-  LispObj* restartsp = ps->restartsp;
-  LispObj entry;
+  register CProcessorState *ps = c_processor;
+  Integer oldfp = ps->StackCacheBase + (ps->fp - ps->StackCache);
+  CObject entry;
 
-  ps->sp = restartsp;
-  if (ps->sp + 8 > ps->StackCacheLimit)
-    StackCacheScrollUp();      
+  if (!FetchTrapVectorEntry(index, &entry)) return 0;
+  ps->sp = ps->restartsp;
+  EnsureStackCacheSpace(8);
   /* PushContinuation (ps->continuation); */
   ps->sp[1].TAG = 0300 | ps->continuation.TAG;
   ps->sp[1].DATA = ps->continuation.DATA;
@@ -327,7 +326,7 @@ int TakePreTrap (Integer index, LispObj* extra1, LispObj* extra2)
     ps->sp++;
   }
   
-  ps->fp = restartsp + 1;
+  ps->fp = ps->restartsp + 1;
   ps->lp = ps->sp + 1;
   ps->control =
     /* First clear a bunch of fields */
@@ -341,34 +340,28 @@ int TakePreTrap (Integer index, LispObj* extra1, LispObj* extra2)
 		     ControlCallerFrameSize))
     /* Set CR.ArgumentSize */
     | (ps->lp - ps->fp)
-    /* Call for effect */
-    | (ValueDispositionEffect << 10)
+    /* Trap handlers return the instruction result to the caller. */
+    | (ValueDispositionValue << 18)
     /* Set CR.CallerFrameSize */
-    | ((ps->fp - oldfp) << 9);
+    | ((ps->StackCacheBase + (ps->fp - ps->StackCache) - oldfp) << 9);
   /* return to erring instruction (pre-trap) */
   ps->continuation = ps->pc;
-  if (!FetchTrapVectorEntry(index, &entry))
-    return(0);
   /* Set Trap Mode */
   if (ReadControlTrapMode(ps->control) < TagCdr(entry.TAG))
     WriteControlTrapMode(ps->control, TagCdr(entry.TAG));
   ps->pc = entry;
-  /* --- check for control-stack overflow
-  if (ps->sp > ControlStackLimit())
-    StackOverflow();
-   */
-  return(1);
+  return CheckControlStack(0);
 }
 
-int TakePostTrap(int index, int arity, LispObj* nextpc)
+int TakePostTrap(int index, int arity, CObject* nextpc)
 {
-  register ProcessorState *ps = processor;
-  LispObj* oldfp = ps->fp;
-  LispObj entry;
+  register CProcessorState *ps = c_processor;
+  Integer oldfp = ps->StackCacheBase + (ps->fp - ps->StackCache);
+  CObject entry;
   int i;
 
-  if (ps->sp + 8 > ps->StackCacheLimit)
-    StackCacheScrollUp();      
+  if (!FetchTrapVectorEntry(index, &entry)) return 0;
+  EnsureStackCacheSpace(8);
   /* move operands down to make room for frame */
   for (i = 0; i < arity; i++)
     ps->sp[4-i] = ps->sp[-i];
@@ -403,30 +396,41 @@ int TakePostTrap(int index, int arity, LispObj* nextpc)
 		     ControlCallerFrameSize))
     /* Set CR.ArgumentSize */
     | (ps->lp - ps->fp)
-    /* Call for effect */
-    | (ValueDispositionEffect << 10)
+    /* Trap handlers return the instruction result to the caller. */
+    | (ValueDispositionValue << 18)
     /* Set CR.CallerFrameSize */
-    | ((ps->fp - oldfp) << 9);
+    | ((ps->StackCacheBase + (ps->fp - ps->StackCache) - oldfp) << 9);
   /* return to instruction's succesor (post-trap) */
   ps->continuation = *nextpc;
-  if (!FetchTrapVectorEntry(index, &entry))
-    return(0);
   /* Set Trap Mode */
   if (ReadControlTrapMode(ps->control) < TagCdr(entry.TAG))
     WriteControlTrapMode(ps->control, TagCdr(entry.TAG));
   ps->pc = entry;
-  /* --- check for control-stack overflow
-  if (ps->sp > ControlStackLimit())
-    StackOverflow();
-   */
-  return(1);
+  return CheckControlStack(1);
 }
 
-int TakeInstructionException(int instruction, LispObj* op2, LispObj* nextpc)
+int CheckControlStack(int post_trap)
+{
+  CProcessorState *ps = c_processor;
+  unsigned mode = ReadControlTrapMode(ps->control);
+  Integer limit = mode ? ps->ControlStackExtraLimit : ps->ControlStackLimit;
+  if (ps->StackCacheBase + (ps->sp - ps->StackCache) < limit) return 1;
+  if (post_trap && mode) {
+    ps->halt_reason = 4; /* HaltReason_FatalStackOverflow */
+    return 0;
+  }
+  /* The call/trap frame and its new PC are already installed. The overflow
+     handler grows the stack and resumes at that PC, not at FINISH-CALL. */
+  CPC resume = ps->pc;
+  ps->restartsp = ps->sp;
+  return TakePostTrap(StackOverflowTrapVector, 0, &resume);
+}
+
+int TakeInstructionException(int instruction, CObject* op2, CObject* nextpc)
 {
   int opcode = ldb(8,10,instruction);
   const ExceptionInfo* ei = &InstructionExceptionInfo[opcode];
-  register ProcessorState *ps = processor;
+  register CProcessorState *ps = c_processor;
   int vector;
 
   ps->sp = ps->restartsp;
@@ -450,7 +454,7 @@ int TakeInstructionException(int instruction, LispObj* op2, LispObj* nextpc)
     vector = InstructionExceptionVector + opcode;
   else if (ei->arity > 1)
     vector = ArithmeticInstructionExceptionVector +
-	       dpb(opcode,5,6,dpb(ps->sp[-1].TAG,3,3,ps->sp[0].TAG));
+	       dpb(opcode,5,6,dpb(ps->sp[-1].TAG,3,3,ps->sp[0].TAG & 7));
   else
     vector = ArithmeticInstructionExceptionVector +
 	       dpb(opcode,5,6,dpb(ps->sp[0].TAG,3,3,0));

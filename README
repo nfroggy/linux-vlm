@@ -5,6 +5,13 @@ if you don't know what it is, you probably don't want it...
 based on the admirable work of Brad Parker who changed the alpha assembler
 code generator to produce c-code runnable on an x86_64 platform
 
+The default build now uses the direct Ivory interpreter in c-emulator. It
+shares the VLM memory manager, world loader, debugger interface, networking,
+and other host services. The generated Alpha interpreter remains available
+with -DVLM_C_ENGINE=OFF for comparison.
+This implements the virtual Ivory environment used by Genera. Operations
+unsupported by the legacy VLM, such as UNIFY, still enter the guest trap path.
+
 this version uses a TUNTAP tap device for networking, that way
 it doesn't need root privileges to run if you define a tap
 interface beforehand. I decided to use a tap (as opposed to a tun)
@@ -76,10 +83,21 @@ The default Release build preserves -Ofast and -march=native. Use
 -DCMAKE_BUILD_TYPE=Debug for debugging, -DVLM_FAST=OFF for -O2 in Release,
 or -DVLM_NATIVE=OFF to build for other x86_64 CPUs. See INSTALL for all options.
 
-CLISP is optional when using the checked-in interpreter sources. To regenerate
-them from the Alpha assembler and Lisp macros, configure with
--DVLM_REGENERATE_STUBS=ON. Generated C files go into build/stub and are rebuilt
+The C engine does not need CLISP or generated interpreter sources. To regenerate
+the legacy engine from the Alpha assembler and Lisp macros, configure with
+-DVLM_C_ENGINE=OFF -DVLM_REGENERATE_STUBS=ON. Generated C files go into build/stub and are rebuilt
 when their inputs change; the checked-in copies are not overwritten.
+
+For an existing build that has cached VLM_C_ENGINE=OFF, reconfigure with
+cmake -S . -B build -DVLM_C_ENGINE=ON, then rebuild. The ivory-cpu test exercises
+the selected engine without a world image, display, or network device. It
+covers arithmetic, memory and register access, calls, APPLY, bindings,
+unwind-protect, stack-cache movement, interrupts, and guest trap handlers.
+
+To check block-address registers across garbage collection, load
+tests/bar-gc.lisp in a fresh Genera test session. It forces GC between a box's
+allocation and initialization, then verifies all four fields. Success prints
+"BAR GC regression passed." The test enables ephemeral GC in that session.
 
 To check shutdown with a real world, prefix your normal ./build/src/genera command
 with "python3 tests/shutdown.py --". This requires a working X display and TAP

@@ -197,7 +197,7 @@ int main (int argc, char** argv)
                       IEEE_TRAP_ENABLE_UNF +
                       IEEE_TRAP_ENABLE_INE);
 
-#elif defined(OS_LINUX)
+#elif defined(OS_LINUX) && !defined(VLM_C_ENGINE)
 #ifdef FE_NOMASK_ENV
   fesetenv (FE_NOMASK_ENV);
 #else

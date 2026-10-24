@@ -113,6 +113,8 @@ int MemoryActionTable[13][64] =
  * emulated iCache hits, it will more than make up for it, and this way we will
  * benefit from future increases in Alpha DCache size increases.
  */
+
+#ifndef VLM_C_ENGINE
 DISPATCHTABLE(halfworddispatch,256*4)
 #ifdef DEBUGICACHE
  ;
@@ -603,6 +605,8 @@ DISPATCHTABLE(internalregisterwrite2,34)
   WriteRegisterError				/* WriteRegisterConstant */
 };
 
+#endif /* !VLM_C_ENGINE */
+
 #ifdef STATISTICS
 static char *halfwordnames [256*4]
  = {
@@ -1063,6 +1067,9 @@ void ResetTrapData (void)
 //extern void ICACHEMISS(void);
 extern void *ICACHEMISS;
 
+#ifdef VLM_C_ENGINE
+#define ICACHEMISS NULL
+#endif
 #define FLUSHICACHE {CACHELINEP cp = &instructioncache[-1]; int i; for (i = 0; i < icachesize+4; i++, cp++) {cp->code = (char*)/*&*/ICACHEMISS; cp->nextcp = (char *)cp;}}
 #define FLUSHSTACKCACHE memset(stackcache, 0, stackcachesize*sizeof(LispObjRecord))
 
@@ -1070,6 +1077,10 @@ void flushicache (void)
 {
   processor->cp=NULL;
   FLUSHICACHE;
+#ifdef VLM_C_ENGINE
+  extern void CFlushInstructionCache(void);
+  CFlushInstructionCache();
+#endif
 }
 
 #define ALPHAPAGESIZE 8192

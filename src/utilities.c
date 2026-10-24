@@ -403,6 +403,9 @@ static void ProcessCommandArguments (VLMConfig* config, XrmDatabase* options,
 
 static void InterpretOptions (VLMConfig* config, XrmDatabase options)
 {
+#ifdef TRACING
+  char *start, *end2;
+#endif
   NetworkInterface *interface;
   char value[_POSIX_ARG_MAX], *hostName, *end;
   unsigned long hostAddress, datum;

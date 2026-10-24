@@ -1327,6 +1327,19 @@ void AdjustProtection(Integer vma, VMAttribute new_attr)
     *attr = new_attr;
 }
 
+/* Both interpreters must report write barriers to the GC's resident-page
+   scan, whether the barrier is checked explicitly or caught by SIGSEGV. */
+void RecordVirtualMemoryWrite(Integer vma)
+{
+  *ResidentPagesPointer++ = vma;
+  if (ResidentPagesPointer == &ResidentPages[ResidentPages_Size]) {
+    ResidentPagesWrap = TRUE;
+    ResidentPagesPointer = ResidentPages;
+  }
+  AdjustProtection(vma, VMAttributeTable[MemoryPageNumber(vma)] |
+                   VMAttribute_Ephemeral | VMAttribute_Modified);
+}
+
 #ifndef OS_OSF
 /* Memory management interface not provided by modern UNIX and/or Linux */
 
@@ -1391,7 +1404,11 @@ static caddr_t last_vma = NULL;
 static int times = 0;
 //hack - brad
 //extern void DECODEFAULT();
+#ifdef VLM_C_ENGINE
+extern void CMemoryFault(Integer vma);
+#else
 extern void *DECODEFAULT;
+#endif
 
 /* Here on a seg-fault */
 
@@ -1571,7 +1588,11 @@ void segv_handler (int sigval, register siginfo_t *si, void *uc_p)
     {
       /* make genera bus-error */
       processor->vma = (uint64_t)vma;
+#ifdef VLM_C_ENGINE
+      CMemoryFault(vma);
+#else
       uc->uc_mcontext.gregs[REG_RIP] = (uint64_t)DECODEFAULT;
+#endif
       return;
     }
   }
@@ -1588,17 +1609,13 @@ void segv_handler (int sigval, register siginfo_t *si, void *uc_p)
     case VMAttribute_Exists|VMAttribute_TransportDisable|VMAttribute_TransportFault:
       {
 	/* no Lisp fault, just note ephemeral and modified and retry */
-	register PHTEntry *ptr = ResidentPagesPointer;
-	
-	*ptr = vma;
-	if (++ptr >= &ResidentPages[ResidentPages_Size])
-	{
-	  ResidentPagesWrap = TRUE;
-	  ptr = ResidentPages;
-	}
-	ResidentPagesPointer = ptr;
-    
-	AdjustProtection(vma, attr|(VMAttribute_Ephemeral|VMAttribute_Modified));
+	RecordVirtualMemoryWrite(vma);
+        /* A later GC can protect this same page again. A handled barrier
+           must not count toward the repeated unhandled-fault limit. */
+        if (!VMEphemeral(attr) || !VMModified(attr)) {
+          last_vma = NULL;
+          times = 0;
+        }
       }
       break;
 
@@ -1623,7 +1640,11 @@ void segv_handler (int sigval, register siginfo_t *si, void *uc_p)
       /* a true fault, advance the pc into the fault handler */
       processor->vma = (uint64_t)vma;
 //printf("RIP = DECODEFAULT #2 (old rip %p)\n", (void *)uc->uc_mcontext.gregs[REG_RIP]);
+#ifdef VLM_C_ENGINE
+      CMemoryFault(vma);
+#else
       uc->uc_mcontext.gregs[REG_RIP] = (uint64_t)DECODEFAULT;
+#endif
 //printf("RIP = DECODEFAULT #2 (new rip %p)\n", (void *)DECODEFAULT);
   }
 }

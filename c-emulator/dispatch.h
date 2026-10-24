@@ -11,6 +11,11 @@ extern const char *ivory_dispatch_names[];
 
 typedef enum _IvoryDispatch
 {
+  DispatchDoubleFloatOpFP,
+  DispatchDoubleFloatOpLP,
+  DispatchDoubleFloatOpSP,
+  DispatchDoubleFloatOpImmediate,
+  DispatchDoubleFloatOpPop,
   DispatchCarFP,
   DispatchCarLP,
   DispatchCarSP,
@@ -174,6 +179,9 @@ typedef enum _IvoryDispatch
   DispatchReturnKludgeImmediate,
   DispatchReturnKludgePop,
   DispatchTakeValues,
+  DispatchUnbindNFP,
+  DispatchUnbindNLP,
+  DispatchUnbindNSP,
   DispatchUnbindNImmediate,
   DispatchUnbindNPop,
   DispatchPushInstanceVariable,

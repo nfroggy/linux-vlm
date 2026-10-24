@@ -1,6 +1,8 @@
 /* -*- Mode:C; Lowercase: Yes -*- */
 
 #include <stdio.h>
+#include <math.h>
+#include <fenv.h>
 #include <stdlib.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -19,194 +21,141 @@
 #include "ivory.h"
 #include "memory.h"
 
-volatile int suspend = 0;
+static sigjmp_buf trap_environment;
+static CObject trap_vma = COBJECT(TypeLocative, 0);
+static CObject trap_microstate = COBJECT(TypeFixnum, 0);
+Integer c_memory_vma;
 
-typedef enum _SuspendType
-{
-  SuspendNone,
-  SuspendSpy,
-  SuspendLowPriority,
-  SuspendHighPriority,
-  SuspendReset
-} SuspendType;
-
-static jmp_buf trap_environment;
-static LispObj trap_vma = { TypeLocative, 0 };
-static LispObj trap_microstate = { TypeFixnum, 0 };
-Integer memory_vma;
-
-/* General memory trap signalling */
 void TakeMemoryTrap(int vector, Integer vma)
 {
   trap_vma.DATA.u = vma;
-  longjmp(trap_environment, vector);
+  siglongjmp(trap_environment, vector);
 }
-
-void TakeIllegalOperandTrap(int microstate, LispObj* operand)
+static void TakeErrorTrap(int microstate, Integer vma)
 {
   trap_microstate.DATA.s = microstate;
-  trap_vma.DATA.u = processor->StackCacheBase + (operand - processor->StackCache);
-  longjmp(trap_environment, ErrorTrapVector);
+  trap_vma.DATA.u = vma;
+  siglongjmp(trap_environment, ErrorTrapVector);
 }
-
-void TakeInstructionExceptionTrap()
+void TakeIllegalOperandTrap(int microstate, CObject *operand)
 {
-  longjmp(trap_environment, InstructionExceptionVector);
+  TakeErrorTrap(microstate, c_processor->StackCacheBase + (operand - c_processor->StackCache));
 }
-
-/* Convert SEGV's into appropriate trap */
-static void segv_handler (int number)
-{
-  /* --- figure out real fault reason: r/o, transport?, missing */
-  TakeMemoryTrap(PageNotResidentTrapVector, memory_vma);
-}
-
-/* Go to spy when IO pending */
-static void io_handler (int number)
-{
-  suspend = SuspendSpy;
-}
-
-void SendInterruptToEmulator ()
-{
-  suspend = SuspendHighPriority;
-}
-
-static void ProcessSuspend()
-{
-  register SuspendType s = suspend;
- 
-  suspend = SuspendNone;
-  switch (s)
-  {
-    case SuspendSpy:
-     longjmp(trap_environment, -1);
-    case SuspendLowPriority:
-     longjmp(trap_environment, LowPrioritySequenceBreakTrapVector);
-    case SuspendHighPriority:
-     longjmp(trap_environment, HighPrioritySequenceBreakTrapVector);
-    case SuspendReset:
-     longjmp(trap_environment, ResetTrapVector);
-  }
-}    
+void TakeInstructionExceptionTrap(void)
+{ siglongjmp(trap_environment, InstructionExceptionVector); }
 
 /* Memory interface */
 
-int ReadVirtualMemory (Integer vma, LispObj *object)
+int CReadVirtualMemory (Integer vma, CObject *object)
 {
-  Integer stack_cache_index = vma - processor->StackCacheBase;
+  Integer stack_cache_index = vma - c_processor->StackCacheBase;
 
-  if (stack_cache_index < StackCacheSize * PageSize)
+  if (stack_cache_index < c_processor->StackCacheOverflowLimit)
   {
-    *object = processor->StackCache[stack_cache_index];
+    *object = c_processor->StackCache[stack_cache_index];
     return(0);
   }
-  VirtualMemoryRead (vma, object);
+  CRawRead (vma, object);
   return(0);
 }
 
-int WriteVirtualMemory (Integer vma, LispObj *object)
+int CWriteVirtualMemory (Integer vma, CObject *object)
 {
-  Integer stack_cache_index = vma - processor->StackCacheBase;
+  Integer stack_cache_index = vma - c_processor->StackCacheBase;
 
-  if (stack_cache_index < StackCacheSize * PageSize)
-    processor->StackCache[stack_cache_index] = *object;
-  VirtualMemoryWrite (vma, object);
+  if (stack_cache_index < c_processor->StackCacheOverflowLimit)
+    c_processor->StackCache[stack_cache_index] = *object;
+  else CRawWrite (vma, object);
   return(0);
 }
 
-int ReadVirtualMemoryBlock (Integer vma, LispObj *object, int count)
+int CReadVirtualMemoryBlock(Integer vma, CObject *object, int count)
 {
-  Integer stack_cache_index = vma - processor->StackCacheBase;
+  for (int i = 0; i < count; ++i) CReadVirtualMemory(vma + i, object + i);
+  return 0;
+}
 
-  if (stack_cache_index < StackCacheSize * PageSize)
-  {
-    for ( ; count--; vma++, object++)
-      ReadVirtualMemory(vma, object);
-    return(0);
+int CWriteVirtualMemoryBlock(Integer vma, CObject *object, int count)
+{
+  for (int i = 0; i < count; ++i) CWriteVirtualMemory(vma + i, object + i);
+  return 0;
+}
+
+void StackCacheScrollUp(void)
+{
+  CProcessorState *ps = c_processor;
+  CRawWriteBlock(ps->StackCacheBase, ps->StackCache, PageSize);
+  memmove(ps->StackCache, ps->StackCache + PageSize,
+          (ps->StackCacheWords - PageSize) * sizeof(CObject));
+  ps->StackCacheBase += PageSize;
+  ps->fp -= PageSize; ps->sp -= PageSize; ps->lp -= PageSize;
+  ps->restartsp -= PageSize;
+  ps->StackCacheOverflowLimit = ps->StackCacheOverflowLimit > PageSize ?
+      ps->StackCacheOverflowLimit - PageSize : 0;
+  memset(ps->StackCache + ps->StackCacheWords - PageSize, 0, PageSize * sizeof(CObject));
+}
+
+void StackCacheScrollDown(void)
+{
+  CProcessorState *ps = c_processor;
+  /* Stack-switch may place the base at an arbitrary word, even the first
+     frame of a mapped page. Fill exactly the missing frame, never a page
+     below it. Preserve through restartsp so a fault can restart the return. */
+  ptrdiff_t count = ps->StackCache - ps->fp;
+  ptrdiff_t live = (ps->sp > ps->restartsp ? ps->sp : ps->restartsp) - ps->StackCache + 1;
+  if (count <= 0) return;
+  if (live < 0) live = 0;
+  if (count + live > ps->StackCacheWords) TakeMemoryTrap(StackOverflowTrapVector, ps->StackCacheBase);
+  CObject fill[ps->StackCacheWords];
+  CRawReadBlock(ps->StackCacheBase - count, fill, count);
+  memmove(ps->StackCache + count, ps->StackCache, live * sizeof(CObject));
+  memcpy(ps->StackCache, fill, count * sizeof(CObject));
+  ps->StackCacheBase -= count;
+  ps->fp += count; ps->sp += count; ps->lp += count;
+  ps->restartsp += count;
+  if (ps->StackCacheOverflowLimit < count + live)
+    ps->StackCacheOverflowLimit = count + live;
+}
+
+void EnsureStackCacheSpace(unsigned words)
+{
+  CProcessorState *ps = c_processor;
+  unsigned needed = ps->sp - ps->StackCache + words + 128;
+  if (needed <= ps->StackCacheOverflowLimit) return;
+  unsigned limit = needed + 128;
+  CObject probe;
+  CRawRead(ps->StackCacheBase + limit, &probe);
+  while (limit > ps->StackCacheWords) {
+    StackCacheScrollUp();
+    limit -= PageSize;
   }
-  VirtualMemoryReadBlock (vma, object, count);
-  return(0);
+  /* The valid cache extent also governs memory operands and host callbacks. */
+  ps->StackCacheOverflowLimit = limit;
 }
 
-int WriteVirtualMemoryBlock (Integer vma, LispObj *object, int count)
-{
-  Integer stack_cache_index = vma - processor->StackCacheBase;
-
-  if (stack_cache_index < StackCacheSize * PageSize)
-  {
-    for ( ; count--; vma++, object++)
-      WriteVirtualMemory(vma, object);
-    return(0);
-  }
-  VirtualMemoryWriteBlock (vma, object, count);
-}
-
-void StackCacheScrollUp (void)
-{
-  Integer shadow;
-  int i;
-
-  if (Trace)
-    fprintf (stderr, "StackCacheScrollUp\n");
-  /* --- PageSize s/b StackCacheScrollAmount */
-  VirtualMemoryWriteBlock(processor->StackCacheBase, processor->StackCache, PageSize);
-
-  for (i = (StackCacheSize - 1); i--; )
-    {
-      memcpy((char *)&processor->StackCache[i*PageSize],
-             (char *)&processor->StackCache[(1 + i)*PageSize],
-	     sizeof(LispObj [PageSize]));
-    }
-  processor->fp -= PageSize;
-  processor->sp -= PageSize;
-  processor->lp -= PageSize;
-  processor->StackCacheBase += PageSize;
-}
-  
-void StackCacheScrollDown (void)
-{
-  int i;
-
-  if (Trace)
-    fprintf (stderr, "StackCacheScrollDown\n");
-  /* --- PageSize s/b StackCacheScrollAmount */
-  for (i = (StackCacheSize - 1); i--; )
-    {
-      memcpy((char *)&processor->StackCache[(1 + i)*PageSize],
-	     (char *)&processor->StackCache[i*PageSize],
-	     sizeof(LispObj [PageSize]));
-    }
-  processor->fp += PageSize;
-  processor->sp += PageSize;
-  processor->lp += PageSize;
-  processor->StackCacheBase -= PageSize;
-  VirtualMemoryReadBlock(processor->StackCacheBase, processor->StackCache, PageSize);
-}
-
-Boolean EphemeralP (LispObj *obj)
+Boolean EphemeralP (CObject *obj)
 { 
   return(PointerTypeP(TagType(obj->TAG)) && EphemeralAddressP(obj->DATA.u));
 }
 
-Boolean OldspaceAddressP (vma)
+Boolean OldspaceAddressP (Integer vma)
 {
-  register ProcessorState *ps = processor;
+  register CProcessorState *ps = c_processor;
   register int zone = ReadVMAZoneNum(vma);
 	
   if (zone == 0)
     return (ReadVMAEphemeralHalf(vma) == 
              ((ps->EphemeralOldspaceRegister >> ReadVMAEphemeralDemilevel(vma))&01));
   else
-    return (ps->ZoneOldspaceRegister & (1 << zone));
+    return (ps->ZoneOldspaceRegister & (1u << zone));
 }
 
-Boolean OldspaceP (LispObj *obj)
+Boolean OldspaceP (CObject *obj)
 {
   return(PointerTypeP(TagType(obj->TAG)) && OldspaceAddressP(obj->DATA.u));
 }
 
-Byte MemoryActionTable[12][64] =
+Byte CMemoryActionTable[13][64] =
 {
   { 014, 06, 014, 010, 05, 05, 05, 05, 0, 0, 0, 04, 04, 04, 
     04, 04, 04, 04, 04, 04, 04, 04, 04, 04, 04, 04, 04, 04, 
@@ -267,19 +216,21 @@ Byte MemoryActionTable[12][64] =
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
-    0, 0, 0, 0, 0, 0, 0, 0 }
+    0, 0, 0, 0, 0, 0, 0, 0 },
+  { [TypePhysicalAddress] = MemoryActionTransform }
 };
 
-Integer MemoryReadInternal (Integer vma, LispObj *object, Byte row[])
+Integer MemoryReadInternal (Integer vma, CObject *object, Byte row[])
 {
   register int action;
+  static const Byte memory_microstates[13] = {57,58,54,55,54,55,59,59,60,56,60,0,0};
   
   loop:
-  ReadVirtualMemory (vma, object);
-  action = row[TagType(object->TAG)];
+  CReadVirtualMemory (vma, object);
+  action = row[TagType(object->TAG)] & ~MemoryActionTransport;
 
   /* Transport takes precedence over anything but trap */
-  if (action & (MemoryActionTransport|MemoryActionTrap) == MemoryActionTransport)
+  if ((action & (MemoryActionTransport|MemoryActionTrap)) == MemoryActionTransport)
   {
     if (OldspaceAddressP(object->DATA.u))
       TakeMemoryTrap(TransportTrapVector, vma);
@@ -289,35 +240,41 @@ Integer MemoryReadInternal (Integer vma, LispObj *object, Byte row[])
   case 0:
     return (vma);
   case MemoryActionTrap:
-    TakeMemoryTrap(ErrorTrapVector, vma);
+    TakeErrorTrap(memory_microstates[(row - (Byte *)CMemoryActionTable) / 64], vma);
   case MemoryActionTransform:
-    object->TAG = MergeCdr(object->TAG, TypeExternalValueCellPointer);
+    object->TAG = MergeCdr(object->TAG, row == CMemoryActionTable[CycleRawTranslate] ? TypeLocative : TypeExternalValueCellPointer);
     return(vma);
-  /* ---
   case MemoryActionBinding:
-    vma = LookupDeepBinding(vma);
+  {
+    CObject key, value;
+    Integer slot = c_processor->DynamicBindingCacheBase +
+                   ((vma << 1) & c_processor->DynamicBindingCacheMask);
+    CReadVirtualMemory(slot, &key);
+    if (key.DATA.u != vma) TakeMemoryTrap(DBCacheMissTrapVector, vma);
+    CReadVirtualMemory(slot + 1, &value);
+    vma = value.DATA.u;
     goto loop;
-   */
+  }
   case MemoryActionMonitor:
     TakeMemoryTrap(MonitorTrapVector, vma);
   case MemoryActionIndirect:
     vma = object->DATA.u;
     goto loop;
   default:
-    fprintf(stderr, "Bad memory action\n");
-    exit(1);
+    TakeErrorTrap(0, vma);
+    return vma;
   }
 }
 
-int StoreContentsInternal (Integer vma, LispObj *object, Byte row[])
+int StoreContentsInternal (Integer vma, CObject *object, Byte row[])
 {
-  LispObj dest;
+  CObject dest;
 
   vma = MemoryReadInternal(vma, &dest, row); 
   
   dest.TAG = MergeCdr(dest.TAG, object->TAG);
   dest.DATA.u = object->DATA.u;
-  return (WriteVirtualMemory(vma, &dest));
+  return (CWriteVirtualMemory(vma, &dest));
 }
 
 /**** Lists ****/
@@ -325,7 +282,7 @@ int StoreContentsInternal (Integer vma, LispObj *object, Byte row[])
 #ifdef __GNUC__
 /*++inline++*/
 #endif
-static int CarInternal (LispObj *l, LispObj *result)
+static int CarInternal (CObject *l, CObject *result)
 {
   switch (TagType(l->TAG))
   {
@@ -348,9 +305,9 @@ static int CarInternal (LispObj *l, LispObj *result)
 #ifdef __GNUC__
 /*++inline++*/
 #endif
-static int CdrInternal (LispObj *l, LispObj *result)
+static int CdrInternal (CObject *l, CObject *result)
 {
-  LispObj cdr; Integer vma;
+  CObject cdr; Integer vma;
   
   switch(TagType(l->TAG))
   {
@@ -387,10 +344,10 @@ static int CdrInternal (LispObj *l, LispObj *result)
 #ifdef __GNUC__
 /*++inline++*/
 #endif
-static int CarCdrInternal (LispObj *l, LispObj *car, LispObj *cdr)
+static int CarCdrInternal (CObject *l, CObject *car, CObject *cdr)
 { 
   /* l may be eq to car, so must save it for cdring*/
-  LispObj templ = *l;
+  CObject templ = *l;
 
   /* CarCdr is not allowed on Locatives */
   if (!TypeEqualP(l->TAG,TypeLocative) && !CarInternal (l, car))
@@ -407,9 +364,9 @@ static int CarCdrInternal (LispObj *l, LispObj *car, LispObj *cdr)
 #ifdef __GNUC__
 /*++inline++*/
 #endif
-static void Aref1Internal (Integer vma, int packing, int offset, ArrayElementType type, int index, LispObj* result)
+static void Aref1Internal (Integer vma, int packing, int offset, ArrayElementType type, int index, CObject* result)
 {
-  LispObj q;
+  CObject q;
 
   if (type == ArrayElementTypeObject && packing == 0)
   {
@@ -421,7 +378,7 @@ static void Aref1Internal (Integer vma, int packing, int offset, ArrayElementTyp
   index += offset;
   MemoryReadData(vma + (index >> packing), &q);
   if (!TypeFixnumP(q.TAG))
-    TakeMemoryTrap(ErrorTrapVector, vma + (index >> packing));
+    TakeErrorTrap(0, vma + (index >> packing));
   if (packing)
     q.DATA.u = ArrayElementLdb(packing, index, q.DATA.u);
 
@@ -442,7 +399,7 @@ static void Aref1Internal (Integer vma, int packing, int offset, ArrayElementTyp
 	*result = ObjectNIL;
       break;
     case ArrayElementTypeObject:
-      TakeMemoryTrap(ErrorTrapVector, vma - 1);
+      TakeErrorTrap(0, vma - 1);
   }
 }
 
@@ -450,7 +407,7 @@ static void Aref1Internal (Integer vma, int packing, int offset, ArrayElementTyp
 #ifdef __GNUC__
 /*++inline++*/
 #endif
-static void Aset1Internal (Integer vma, int packing, int offset, ArrayElementType type, int index, LispObj* value)
+static void Aset1Internal (Integer vma, int packing, int offset, ArrayElementType type, int index, CObject* value)
 {
   if (type == ArrayElementTypeObject && packing == 0)
   {
@@ -460,7 +417,7 @@ static void Aset1Internal (Integer vma, int packing, int offset, ArrayElementTyp
 
   {
     Integer data = value->DATA.u;
-    LispObj q;
+    CObject q;
 
     switch (type)
     {
@@ -480,28 +437,28 @@ static void Aset1Internal (Integer vma, int packing, int offset, ArrayElementTyp
 	  data = -1;
 	break;
       case ArrayElementTypeObject:
-        TakeMemoryTrap(ErrorTrapVector, vma - 1);
+        TakeErrorTrap(0, vma - 1);
     }
 
     index += offset;
     vma = MemoryReadData(vma + (index >> packing), &q);
     if (!TypeFixnumP(q.TAG))
-      TakeMemoryTrap(ErrorTrapVector, vma);
+      TakeErrorTrap(0, vma);
     if (packing)
       q.DATA.u = ArrayElementDpb(data,packing,index,q.DATA.u);
     else
       q.DATA.u = data;
-    WriteVirtualMemory(vma, &q);
+    CWriteVirtualMemory(vma, &q);
   }
 }
 
-static void RecomputeArrayRegister(LispObj* areg, int count)
+static void RecomputeArrayRegister(CObject* areg, int count)
 {
   switch (TagType(areg[-1].TAG))
   {
   case TypeArray: case TypeString:
     {
-      LispObj header;
+      CObject header;
       Integer vma;
     
       vma = MemoryReadHeader(areg[-1].DATA.u, &header);
@@ -525,9 +482,9 @@ static void RecomputeArrayRegister(LispObj* areg, int count)
 
 /**** Instances ****/
 
-static Integer LocateInstanceVariableMapped (LispObj *map, LispObj *self, Integer n)
+static Integer LocateInstanceVariableMapped (CObject *map, CObject *self, Integer n)
 {
-  LispObj header, offset;
+  CObject header, offset;
   Integer vma;
 
   if (!TypeEqualP(map->TAG, TypeArray))
@@ -548,16 +505,17 @@ static Integer LocateInstanceVariableMapped (LispObj *map, LispObj *self, Intege
   return (vma + offset.DATA.u);
 }
 
-static Integer LocateArbitraryInstanceVariable (LispObj *instance, LispObj *offset)
+static Integer LocateArbitraryInstanceVariable (CObject *instance, CObject *offset)
 {
-  LispObj flavor, size;
+  CObject flavor, size;
   Integer vma;
 
-  if (ldb(4, 2, instance->TAG) != ldb(4, 2, TypeInstance))
+  if (ldb(4, 2, instance->TAG) != ldb(4, 2, TypeInstance)) {
     if (TypeSpareP(instance->TAG))
       TakeInstructionExceptionTrap();
     else
       TakeIllegalOperandTrap(0, instance);
+  }
   if (!TypeFixnumP(offset->TAG))
     TakeIllegalOperandTrap(0, offset);
   vma = MemoryReadHeader(instance->DATA.u, &flavor);
@@ -570,9 +528,9 @@ static Integer LocateArbitraryInstanceVariable (LispObj *instance, LispObj *offs
 
 int PullApplyArgsQuickly (int count)
 {
-  register ProcessorState *ps = processor;
-  register LispObj *sp = ps->sp;
-  LispObj *rest = &ps->StackCache[(*sp--).DATA.u - ps->StackCacheBase];
+  register CProcessorState *ps = c_processor;
+  register CObject *sp = ps->sp;
+  CObject *rest = &ps->StackCache[(*sp--).DATA.u - ps->StackCacheBase];
   int supplied = ReadControlArgumentSize(ps->control);
   register int i;
 
@@ -611,7 +569,7 @@ int PullApplyArgsQuickly (int count)
       case TypeList:
         {
           Integer offset = rest->DATA.u - ps->StackCacheBase;
-          if (offset < StackCacheSize * PageSize)
+          if (offset < c_processor->StackCacheOverflowLimit)
           {
             rest = &ps->StackCache[offset];
             break;
@@ -625,6 +583,7 @@ int PullApplyArgsQuickly (int count)
 	ps->sp = sp;
 	return(count - (i + 1));
       }      
+      break;
     default:
       /* Contrary to KHS's emulator, ucode Traps on bad CDR */
       goto trap;
@@ -644,21 +603,21 @@ int PullApplyArgsQuickly (int count)
 
 static int Unbind(void)
 { 
-  LispObj old, loc;
-  Integer bsp = processor->BindingStackPointer;
+  CObject old, loc;
+  Integer bsp = c_processor->BindingStackPointer;
 
-  if (!ReadControlCleanupBindings(processor->control))
+  if (!ReadControlCleanupBindings(c_processor->control))
     return (-1);
-  if (Trace)
-    fprintf(stderr, "Unbind\n");
   MemoryRead(bsp, &old, CycleBindRead);
   MemoryRead(bsp - 1, &loc, CycleBindRead);
+  if (Trace) fprintf(stderr, "Unbind BSP=%08x loc=%02x.%08x control=%08x\n", bsp, loc.TAG, loc.DATA.u, c_processor->control);
   StoreContents(loc.DATA.u, &old, CycleBindWrite);
   /* no more chance of pclsr-ing */
-  processor->BindingStackPointer = bsp - 2;
-  WriteControlCleanupBindings(processor->control, ldb(1,6,loc.TAG));
-  if (ldb(1,1,processor->PreemptRegister))
-    processor->PreemptRegister |= 1;
+  c_processor->BindingStackPointer = bsp - 2;
+  WriteControlCleanupBindings(c_processor->control, ldb(1,6,loc.TAG));
+  if (ldb(1,1,c_processor->PreemptRegister))
+    c_processor->PreemptRegister |= 1;
+  CRequestPreemptCheck();
   return (0);
 }
 
@@ -685,67 +644,57 @@ Integer ALUFunctionBoolean(Integer ALU, Integer op1, Integer op2)
     case BooleNand: return(~(op1&op2));
     case BooleSet: return( -1 );
   }
+  return 0;
+}
+
+static uint32_t RotateLeft(uint32_t value, unsigned count)
+{
+  count &= 31;
+  return (value << count) | (value >> ((32 - count) & 31));
 }
 
 Integer ALUFunctionByte(Integer ALU, Integer op1, Integer op2)
 {
-  Integer background;
-  int rotate = processor->ByteRotate;
-  int size = processor->ByteSize;
-  int rotated, mask;
-
-  switch (ReadALUByteBackground(ALU))
-  {
-    case ALUByteBackgroundOp1: 
-      background = op1; break;
-    case ALUByteBackgroundRotateLatch: 
-      background = processor->RotateLatch; break;
-    case ALUByteBackgroundZero: 
-      background = 0; break;
+  uint32_t background;
+  switch (ReadALUByteBackground(ALU)) {
+    case ALUByteBackgroundOp1: background = op1; break;
+    case ALUByteBackgroundRotateLatch: background = c_processor->RotateLatch; break;
+    default: background = 0; break;
   }
-  
-  switch (ReadALUByteFunction(ALU))
-  {
-    case ALUByteFunctionDpb:
-      rotated = op2 << rotate;
-      mask = (~(-2 << size)) << rotate;
-      if (ReadALUByteRotateLatch(ALU))
-        processor->RotateLatch = rotated | ((unsigned)op2 >> ((32 - rotate) & 0x1f));
-      return((rotated&mask)|(background&~mask));
-    case ALUByteFunctionLdb:
-      rotated = (unsigned)op2 >> ((32 - rotate) & 0x1f);
-      mask = ~(-2 << size);
-      if (ReadALUByteRotateLatch(ALU))
-        processor->RotateLatch = rotated | (op2 << rotate);
-      return((rotated&mask)|(background&~mask));
-  }
+  uint32_t rotated = RotateLeft(op2, c_processor->ByteRotate);
+  uint32_t mask = CMask(c_processor->ByteSize + 1);
+  if (ReadALUByteFunction(ALU) == ALUByteFunctionDpb)
+    mask <<= c_processor->ByteRotate;
+  if (ReadALUByteRotateLatch(ALU)) c_processor->RotateLatch = rotated;
+  return (rotated & mask) | (background & ~mask);
 }
 
-Integer ALUFunctionAdder(Integer ALU, Integer op1, Integer op2) 
+Integer ALUFunctionAdder(Integer ALU, Integer op1, Integer op2)
 {
-  int sum;
-
-  switch (ReadALUAdderOp2(ALU))
-  {
+  switch (ReadALUAdderOp2(ALU)) {
     case ALUAdderOp2Op2: break;
-    case ALUAdderOp2Zero: op2 = 0;
-    case ALUAdderOp2Invert: op2 = -op2;
-    case ALUAdderOp2MinusOne: op2 = -1;
+    case ALUAdderOp2Zero: op2 = 0; break;
+    case ALUAdderOp2Invert: op2 = 0u - op2; break;
+    case ALUAdderOp2MinusOne: op2 = UINT32_MAX; break;
   }
-
-  sum = op1 + op2 + ReadALUAdderCarryIn(ALU);
-  processor->ALUOverflow = ((sum >= op1) != (op2 >= 0));
-  processor->ALUBorrow = ((unsigned)op1 < (unsigned)op2);
-  processor->ALULessThan = (op1 < op2);
-  return((Integer)sum);
+  uint64_t wide = (uint64_t)op1 + op2 + ReadALUAdderCarryIn(ALU);
+  int64_t signed_sum = (int64_t)(int32_t)op1 + (int32_t)op2 + ReadALUAdderCarryIn(ALU);
+  c_processor->ALUOverflow = signed_sum > INT32_MAX || signed_sum < INT32_MIN;
+  c_processor->ALUBorrow = op1 < op2;
+  c_processor->ALULessThan = (int32_t)op1 < (int32_t)op2;
+  if (ALU & (1u << 24))
+    c_processor->AluAndRotateControl = dpb(wide >> 32, 1, 10, ALU);
+  return (uint32_t)wide;
 }
 
 Integer ALUFunctionMultiplyDivide(Integer ALU, Integer op1, Integer op2)
 {
-  fprintf(stderr, "Bullshit\n");
+  /* Reserved by the VLM instruction set: handled by the guest exception path. */
+  TakeInstructionExceptionTrap();
+  return 0;
 }
 
-Integer (*ALUFunctionClass[4])() = 
+Integer (*ALUFunctionClass[4])(Integer, Integer, Integer) =
 {
   ALUFunctionBoolean,
   ALUFunctionByte,
@@ -753,11 +702,11 @@ Integer (*ALUFunctionClass[4])() =
   ALUFunctionMultiplyDivide
 };
 
-Boolean ALUComputeCondition (Integer ALU, LispObj *op1, LispObj *op2, int result)
+Boolean ALUComputeCondition (Integer ALU, CObject *op1, CObject *op2, int result)
 {
-  Boolean overflow = processor->ALUOverflow;
-  Boolean borrow = processor->ALUBorrow;
-  Boolean lessthan = processor->ALULessThan;
+  Boolean overflow = c_processor->ALUOverflow;
+  Boolean borrow = c_processor->ALUBorrow;
+  Boolean lessthan = c_processor->ALULessThan;
 
   switch (ReadALUCondition(ALU))
   {
@@ -778,7 +727,7 @@ Boolean ALUComputeCondition (Integer ALU, LispObj *op1, LispObj *op2, int result
     case ConditionHigh25Zero:
       return(!ldb(25,7,result));
     case ConditionEq:
-      return(ObjectEqP(*op1, *op2));
+      return(!result && TypeEqualP(op1->TAG, op2->TAG));
     case ConditionOp1Ephemeralp:
       return(EphemeralP(op1));
     case ConditionResultTypeNil:
@@ -790,30 +739,83 @@ Boolean ALUComputeCondition (Integer ALU, LispObj *op1, LispObj *op2, int result
     case ConditionResultCdrLow:
       return(TagCdr(op1->TAG)&01);
     case ConditionCleanupBitsSet:
-      return(ReadControlCleanupBits(processor->control));
+      return(ReadControlCleanupBits(c_processor->control));
     case ConditionAddressInStackCache:
-      return(op1->DATA.u - processor->StackCacheBase < StackCacheSize * PageSize);
+      return(op1->DATA.u - c_processor->StackCacheBase < c_processor->StackCacheWords);
     case ConditionExtraStackMode:
-      return(!ReadControlTrapMode(processor->control));
+      return(ReadControlTrapMode(c_processor->control) == 1);
     case ConditionFepMode:
-      return(ReadControlTrapMode(processor->control) == 3);
+      return(ReadControlTrapMode(c_processor->control) == 3);
     case ConditionFpCoprocessorPresent:
       return(0);
     case ConditionOp1Oldspacep:
       return(OldspaceP(op1));
     case ConditionPendingSequenceBreakEnabled:
-      ;
-    case ConditionOp1TypeAcceptable:
-      ;
-    case ConditionOp1TypeCondition:
-      ;
+      return((c_processor->PreemptRegister & 3) && ReadControlTrapMode(c_processor->control) == 0);
     case ConditionStackCacheOverflow:
-      ;
+      return(c_processor->sp >= c_processor->StackCacheLimit);
     case ConditionOrLogicVariable:
-      ;
+      return(TypeEqualP(op1->TAG, TypeLogicVariable) || TypeEqualP(op2->TAG, TypeLogicVariable));
     default:
-      fprintf(stderr, "Unimplemented Condition %d\n", ReadALUCondition(ALU)) ;
+      TakeInstructionExceptionTrap();
+      return 0;
   }
+}
+
+/* Fixnums mixed with single floats are coerced to the Ivory single format.
+   Other numeric representations use the guest's arithmetic exception handlers. */
+static int SingleOperands(const CObject *a, const CObject *b, float *x, float *y)
+{
+  unsigned ta = TagType(a->TAG), tb = TagType(b->TAG);
+  if ((ta != TypeFixnum && ta != TypeSingleFloat) ||
+      (tb != TypeFixnum && tb != TypeSingleFloat) ||
+      (ta == TypeFixnum && tb == TypeFixnum)) return 0;
+  *x = ta == TypeFixnum ? (float)a->DATA.s : a->DATA.f;
+  *y = tb == TypeFixnum ? (float)b->DATA.s : b->DATA.f;
+  return 1;
+}
+
+static int SingleDivision(unsigned opcode, const CObject *a, const CObject *b,
+                          CObject *quotient, CObject *remainder)
+{
+  float x,y;
+  if (!SingleOperands(a,b,&x,&y)) return 0;
+  if (!isfinite(x) || !isfinite(y) || y == 0) TakeInstructionExceptionTrap();
+  double q = (double)x / (double)y;
+  switch (opcode) {
+    case OpcodeFloor: q = floor(q); break;
+    case OpcodeCeiling: q = ceil(q); break;
+    case OpcodeTruncate: q = trunc(q); break;
+    default: {
+      double lower = floor(q), fraction = q - lower;
+      q = lower + (fraction > 0.5 || (fraction == 0.5 && fmod(lower,2.0) != 0));
+      break;
+    }
+  }
+  if (q < INT32_MIN || q > INT32_MAX) TakeInstructionExceptionTrap();
+  quotient->TAG = TypeFixnum; quotient->DATA.s = (int32_t)q;
+  remainder->TAG = TypeSingleFloat; remainder->DATA.f = (double)x - q * (double)y;
+  return 1;
+}
+
+static int SingleArithmetic(unsigned opcode, CObject *a, const CObject *b)
+{
+  float x, y, result;
+  if (!SingleOperands(a, b, &x, &y)) return 0;
+  fenv_t env;
+  feholdexcept(&env);
+  switch (opcode) {
+    case OpcodeAdd: result = x + y; break;
+    case OpcodeSub: result = x - y; break;
+    case OpcodeMultiply: result = x * y; break;
+    default: result = x / y; break;
+  }
+  int exception = fetestexcept(FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW | FE_UNDERFLOW);
+  fesetenv(&env);
+  if (exception || !isfinite(result)) TakeInstructionExceptionTrap();
+  a->DATA.f = result;
+  a->TAG = TypeSingleFloat;
+  return 1;
 }
 
 /**** Instruction execution ****/
@@ -823,7 +825,7 @@ Boolean ALUComputeCondition (Integer ALU, LispObj *op1, LispObj *op2, int result
 #define AddressFPOperand() (op2 = &fp[cp->operand])
 #define AddressLPOperand() (op2 = &lp[cp->operand])
 #define AddressPopOperand() (op2 = sp--)
-#define AddressBAR(n) (bar = &processor->bar[n])
+#define AddressBAR(n) (bar = &c_processor->bar[n])
 
 /* Be careful not to side-effect TOS before setting (in case TOS is your arg!) */
 #define PushObject(object) { StoreCdrNext(sp[1],*(object)); sp++; }
@@ -849,10 +851,14 @@ Boolean ALUComputeCondition (Integer ALU, LispObj *op1, LispObj *op2, int result
 #define DontTakeBranch(pops) { sp -= (pops); goto BranchNotTaken; }
 
 #define NextInstruction goto NextInstructionTag
-#define UnimplementedInstruction goto UnimplementedInstructionTag
+#define UnsupportedInstruction goto UnsupportedInstructionTag
 #define InstructionException goto InstructionExceptionTag
 #define IllegalOperand goto IllegalOperandTag
-#define AllowSequenceBreaks { if (suspend) ProcessSuspend(); }
+#define AllowSequenceBreaks do { \
+  int pending = CPollInterrupt(); \
+  if (pending == -1) { ps->halt_reason = 3; goto save_and_halt; } \
+  if (pending > 0) { DecacheRegisters(); TakeMemoryTrap(pending, 0); } \
+} while (0)
 
 #define PushContinuation(c) PushConstant(c.TAG|0300,c.DATA.u)
 #define PushControl(c) PushConstant(TypeFixnum|0300,c)
@@ -860,7 +866,7 @@ Boolean ALUComputeCondition (Integer ALU, LispObj *op1, LispObj *op2, int result
 #define DecacheRegisters() { ps->sp=sp; ps->restartsp=restartsp; ps->fp=fp; ps->lp=lp; ps->pc=pc; }
 #define EncacheRegisters() { sp=ps->sp; restartsp=ps->restartsp; fp=ps->fp; lp=ps->lp; pc=ps->pc; }
 
-void IncrementPC(LispObj* pc, int offset)
+void IncrementPC(CObject* pc, int offset)
 {
    pc->DATA.u += (offset >> 1);
    if (pc->TAG & 1)
@@ -878,43 +884,48 @@ void IncrementPC(LispObj* pc, int offset)
        pc->TAG = TypeEvenPC;
 }
 
-void InstructionSequencer (void)
+int CInstructionSequencer (void)
 {
   /* Do not use register decls without considering setjmp/longjmp effects */
-  /* register */ InstructionCacheLine *cp;
-  /* register */ ProcessorState *ps = processor;
-  /* register */ LispObj *sp = ps->sp;
-  LispObj *restartsp = ps->sp;
-  /* register */ LispObj *fp = ps->fp;
-  /* register */ LispObj *lp = ps->lp;
-  PC pc = ps->pc;
-  LispObj *op1;
-  /* register */ LispObj *op2;
-  LispObj scratch_representation;
-  LispObj *scratch = &scratch_representation;
-  LispObj immediate = { TypeFixnum, 0 };
+  InstructionCacheLine *volatile cp = NULL;
+  /* register */ CProcessorState *ps = c_processor;
+  CObject *volatile sp = ps->sp;
+  CObject *volatile restartsp = ps->sp;
+  CObject *volatile fp = ps->fp;
+  CObject *volatile lp = ps->lp;
+  volatile CPC pc = ps->pc;
+  CObject *op1;
+  CObject *volatile op2 = NULL;
+  CObject scratch_representation;
+  CObject *scratch = &scratch_representation;
+  CObject immediate = COBJECT(TypeFixnum, 0 );
   struct _bar *bar;
   int i;
-  void (*old_io_handler) () = signal(SIGIO, io_handler);
-  void (*old_segv_handler) () = signal(SIGSEGV, segv_handler);
+  ps->halt_reason = 5;
   int vector;
+  volatile int taking_trap = 0;
 
-  if (vector = setjmp(trap_environment))
+  if ((vector = sigsetjmp(trap_environment, 1)))
   {
+    if (taking_trap) goto halt;
+    taking_trap = 1;
     DecacheRegisters();
     switch (vector)
     {
     /* Special "Spy" vector */
     case -1:
       if (Trace) fprintf(stderr, "Spy\n");
-      return;
+      return 3;
 
     /* Traps with no arguments */
     case HighPrioritySequenceBreakTrapVector:
     case LowPrioritySequenceBreakTrapVector:
+    case PreemptRequestTrapVector:
     case ResetTrapVector:
+    case DBUnwindFrameTrapVector:
+    case DBUnwindCatchTrapVector:
       if (Trace)
-	fprintf(stderr, "%08x Trap at PC %08x, VMA %08x, #%d\n", vector, pc.DATA.u,
+	fprintf(stderr, "%08x Trap at PC %08x, VMA %08x, #%lu\n", vector, pc.DATA.u,
 		trap_vma.DATA.u, ps->instruction_count);
       if (!TakePreTrap(vector, 0, 0))
         goto halt;
@@ -923,7 +934,7 @@ void InstructionSequencer (void)
     /* ErrorTrap takes an two arguments */
     case ErrorTrapVector:
       if (Trace)
-	fprintf(stderr, "Illegal operand at PC %08x, VMA %08x, #%d\n", pc.DATA.u,
+	fprintf(stderr, "Illegal operand at PC %08x, VMA %08x, #%lu\n", pc.DATA.u,
 		trap_vma.DATA.u, ps->instruction_count);
       /* Check for errors in a bad spot */
       if (!((trap_vma.DATA.u^(TrapVectorBase + ResetTrapVector))&PageNumberMask))
@@ -933,11 +944,17 @@ void InstructionSequencer (void)
       break;
   
     /* Memory traps with one argument */
+    case DBCacheMissTrapVector:
+    case StackOverflowTrapVector:
     case MonitorTrapVector:
     case TransportTrapVector:
+    case PageFaultRequestTrapVector:
+    case PageWriteFaultTrapVector:
+    case UncorrectableMemoryErrorTrapVector:
+    case MemoryBusErrorTrapVector:
     case PageNotResidentTrapVector:
       if (Trace)
-	fprintf(stderr, "%08x Trap at PC %08x, VMA %08x, #%d\n", vector, pc.DATA.u,
+	fprintf(stderr, "%08x Trap at PC %08x, VMA %08x, #%lu\n", vector, pc.DATA.u,
 		trap_vma.DATA.u, ps->instruction_count);
       /* Check for errors in a bad spot */
       if (!((trap_vma.DATA.u^(TrapVectorBase + ResetTrapVector))&PageNumberMask))
@@ -949,16 +966,16 @@ void InstructionSequencer (void)
     /* InstructionExceptions */
     case InstructionExceptionVector:
       if (Trace)
-	fprintf(stderr, "Instruction exception at PC %08x, #%d\n", pc.DATA.u, ps->instruction_count);
+	fprintf(stderr, "Instruction exception at PC %08x, #%lu\n", pc.DATA.u, ps->instruction_count);
       if(!TakeInstructionException(cp->instruction, op2, &cp->next_pc))
 	goto halt;
       break;
 
     default:
-      fprintf(stderr, "Bad Trap code %o\n", vector);
-      exit(1);
+      goto halt;
     }
     EncacheRegisters();
+    taking_trap = 0;
   }
   goto InstructionCacheLookup;
   
@@ -969,8 +986,13 @@ NextInstructionTag:
   cp = cp->next_cp;
 
 Dispatch:
-  /* Here for things that advance the PC non-sequentially, e.g., branch */
+  /* Here for things that advance the CPC non-sequentially, e.g., branch */
   restartsp = sp;
+  if (sp - ps->StackCache + 128 > ps->StackCacheOverflowLimit) {
+    DecacheRegisters();
+    EnsureStackCacheSpace(0);
+    EncacheRegisters();
+  }
   /* --- for debugging (single-step) only; after each pc advance */
   AllowSequenceBreaks;
 
@@ -979,9 +1001,10 @@ Dispatch:
   ps->instruction_count++;
   if (Trace)
     {
-      fprintf(stderr, "PC %08x(%s), SP: %08x, TOS: %x.%02x.%08x, %s(%d)\n",
+      fprintf(stderr, "PC %08x(%s), SP: %08x, FP: %08x, CR: %08x, TOS: %x.%02x.%08x, %s(%d)\n",
 	cp->pc.DATA.u, (cp->pc.TAG&1)?"Odd ":"Even",
-	ps->StackCacheBase + (sp - ps->StackCache),
+	(unsigned)(ps->StackCacheBase + (sp - ps->StackCache)),
+        (unsigned)(ps->StackCacheBase + (fp - ps->StackCache)), ps->control,
 	TagCdr(sp->TAG), TagType(sp->TAG), sp->DATA.u,
 	ivory_dispatch_names[cp->code],
 	cp->operand);
@@ -991,9 +1014,12 @@ Dispatch:
   {
     case DispatchInstructionCacheLookup:
       InstructionCacheLookup:
+      /* The preceding instruction has committed its stack changes. A fault
+         fetching this PC must restart here, preserving those changes (in
+         particular the return PC pushed by unwind-protect cleanup). */
+      restartsp = sp;
       /* --- debug:  returned to top frame */
-      if (TypeEqualP(pc.TAG, TypeNIL))
-	goto save_and_halt;
+      if (TypeEqualP(pc.TAG, TypeNIL)) { ps->halt_reason = 2; goto save_and_halt; }
       /* --- debug */
       if (!(TypeEqualP(pc.TAG, TypeEvenPC) || TypeEqualP(pc.TAG, TypeOddPC)))
 	InstructionException;
@@ -1012,7 +1038,7 @@ Dispatch:
       goto Dispatch;
       
     case DispatchIllegalInstruction:
-      goto UnimplementedInstructionTag;
+      goto UnsupportedInstructionTag;
       
     case DispatchBranch:
       BranchTaken:
@@ -1128,7 +1154,7 @@ Dispatch:
 	{
 	case TypeList:
 	  { 
-	    LispObj cdr; Integer vma;
+	    CObject cdr; Integer vma;
 
 	    vma = MemoryReadCdr (sp->DATA.u, &cdr);
 	    switch (TagCdr (cdr.TAG))
@@ -1160,8 +1186,8 @@ Dispatch:
       *scratch = *op2;
       for ( ; ; )
 	{ 
-	  LispObj car_rep, cdr_rep;
-	  LispObj *car = &car_rep, *cdr = &cdr_rep;
+	  CObject car_rep, cdr_rep;
+	  CObject *car = &car_rep, *cdr = &cdr_rep;
 
 	  if ( (TagType (scratch->TAG)) == TypeNIL )
 	    { 
@@ -1184,12 +1210,13 @@ Dispatch:
 	      default: 
                 IllegalOperand;
 	      }
-	  else
-	    if (CdrInternal (cdr, scratch))
+          else
+	    if (CdrInternal (cdr, scratch)) {
 	      if (TypeEqualP(cdr->TAG,TypeListInstance) || TypeSpareP(cdr->TAG))
 		InstructionException;
 	      else
 		IllegalOperand;
+	    }
 	  AllowSequenceBreaks;
 	}
       
@@ -1206,8 +1233,8 @@ Dispatch:
       *scratch = *op2;
       for ( ; ; )
 	{ 
-	  LispObj car_rep, cdr_rep;
-	  LispObj *car = &car_rep, *cdr = &cdr_rep;
+	  CObject car_rep, cdr_rep;
+	  CObject *car = &car_rep, *cdr = &cdr_rep;
 
 	  if ( (TagType (scratch->TAG)) == TypeNIL )
 	    {
@@ -1243,8 +1270,8 @@ Dispatch:
       *scratch = *op2;
       for ( ; ; )
 	{ 
-	  LispObj car_rep, cdr_rep;
-	  LispObj *car = &car_rep, *cdr = &cdr_rep;
+	  CObject car_rep, cdr_rep;
+	  CObject *car = &car_rep, *cdr = &cdr_rep;
 
 	  if ( (TagType (scratch->TAG)) == TypeNIL )
 	    {
@@ -1258,8 +1285,8 @@ Dispatch:
 	    case TypeNIL: break;
 	    case TypeList:
 	      {
-		LispObj keyrep;
-		LispObj *key = &keyrep;
+		CObject keyrep;
+		CObject *key = &keyrep;
 	    
 		if (CarInternal (car, key))
 		  InstructionException;
@@ -1386,15 +1413,16 @@ Dispatch:
 	    NextInstruction;
 	  }
 
-    case DispatchEqualNumberImmediate:
-      SetPredicate(TypeFixnumP(sp->TAG) && (sp->DATA.s == cp->operand));
-      NextInstruction;
+    case DispatchEqualNumberImmediate: AddressImmediateOperand(); goto ExecuteEqualNumber;
     case DispatchEqualNumberSP: AddressSPOperand (); goto ExecuteEqualNumber;
     case DispatchEqualNumberFP: AddressFPOperand (); goto ExecuteEqualNumber;
     case DispatchEqualNumberLP: AddressLPOperand (); goto ExecuteEqualNumber;
     case DispatchEqualNumberPop: AddressPopOperand (); goto ExecuteEqualNumber;
     ExecuteEqualNumber:
     MARK(EqualNumber);
+      { float x, y; if (SingleOperands(sp, op2, &x, &y)) {
+        SetPredicate(x == y); NextInstruction;
+      } }
       if (BinaryTypeFixnumP (op2->TAG, sp->TAG))
       {
 	SetPredicate (op2->DATA.s == sp->DATA.s);
@@ -1402,15 +1430,16 @@ Dispatch:
       }
       goto BinaryTypeFixnumExceptions;
       
-    case DispatchEqualNumberNoPopImmediate:
-      PushPredicate(TypeFixnumP(sp->TAG) && (sp->DATA.s == cp->operand));
-      NextInstruction;
+    case DispatchEqualNumberNoPopImmediate: AddressImmediateOperand(); goto ExecuteEqualNumberNoPop;
     case DispatchEqualNumberNoPopSP: AddressSPOperand (); goto ExecuteEqualNumberNoPop;
     case DispatchEqualNumberNoPopFP: AddressFPOperand (); goto ExecuteEqualNumberNoPop;
     case DispatchEqualNumberNoPopLP: AddressLPOperand (); goto ExecuteEqualNumberNoPop;
     case DispatchEqualNumberNoPopPop: AddressPopOperand (); goto ExecuteEqualNumberNoPop;
     ExecuteEqualNumberNoPop:
     MARK(EqualNumberNoPop);
+      { float x, y; if (SingleOperands(sp, op2, &x, &y)) {
+        PushPredicate(x == y); NextInstruction;
+      } }
       if (BinaryTypeFixnumP (op2->TAG, sp->TAG))
 	{
 	  PushPredicate (op2->DATA.s == sp->DATA.s);
@@ -1418,13 +1447,16 @@ Dispatch:
 	}
       goto BinaryTypeFixnumExceptions;
       
-    case DispatchGreaterpImmediate: AddressImmediateOperand (); goto ExecuteGreaterp;
+    case DispatchGreaterpImmediate: AddressImmediateOperand(); goto ExecuteGreaterp;
     case DispatchGreaterpSP: AddressSPOperand (); goto ExecuteGreaterp;
     case DispatchGreaterpFP: AddressFPOperand (); goto ExecuteGreaterp;
     case DispatchGreaterpLP: AddressLPOperand (); goto ExecuteGreaterp;
     case DispatchGreaterpPop: AddressPopOperand (); goto ExecuteGreaterp;
     ExecuteGreaterp:
     MARK(Greaterp);
+      { float x, y; if (SingleOperands(sp, op2, &x, &y)) {
+        SetPredicate(x > y); NextInstruction;
+      } }
       if (BinaryTypeFixnumP (op2->TAG, sp->TAG))
 	{
 	  /* --- Need some assembly hacking to check for overflow */
@@ -1433,13 +1465,16 @@ Dispatch:
 	}
       goto BinaryTypeFixnumExceptions;
       
-    case DispatchGreaterpNoPopImmediate: AddressImmediateOperand (); goto ExecuteGreaterpNoPop;
+    case DispatchGreaterpNoPopImmediate: AddressImmediateOperand(); goto ExecuteGreaterpNoPop;
     case DispatchGreaterpNoPopSP: AddressSPOperand (); goto ExecuteGreaterpNoPop;
     case DispatchGreaterpNoPopFP: AddressFPOperand (); goto ExecuteGreaterpNoPop;
     case DispatchGreaterpNoPopLP: AddressLPOperand (); goto ExecuteGreaterpNoPop;
     case DispatchGreaterpNoPopPop: AddressPopOperand (); goto ExecuteGreaterpNoPop;
     ExecuteGreaterpNoPop:
     MARK(GreaterpNoPop);
+      { float x, y; if (SingleOperands(sp, op2, &x, &y)) {
+        PushPredicate(x > y); NextInstruction;
+      } }
       if (BinaryTypeFixnumP (op2->TAG, sp->TAG))
 	{
 	  /* --- Need some assembly hacking to check for overflow */
@@ -1448,13 +1483,16 @@ Dispatch:
 	}
       goto BinaryTypeFixnumExceptions;
       
-    case DispatchLesspImmediate: AddressImmediateOperand (); goto ExecuteLessp;
+    case DispatchLesspImmediate: AddressImmediateOperand(); goto ExecuteLessp;
     case DispatchLesspSP: AddressSPOperand (); goto ExecuteLessp;
     case DispatchLesspFP: AddressFPOperand (); goto ExecuteLessp;
     case DispatchLesspLP: AddressLPOperand (); goto ExecuteLessp;
     case DispatchLesspPop: AddressPopOperand (); goto ExecuteLessp;
     ExecuteLessp:
     MARK(Lessp);
+      { float x, y; if (SingleOperands(sp, op2, &x, &y)) {
+        SetPredicate(x < y); NextInstruction;
+      } }
       if (BinaryTypeFixnumP (op2->TAG, sp->TAG))
 	{
 	  /* --- Need some assembly hacking to check for overflow */
@@ -1463,13 +1501,16 @@ Dispatch:
 	}
       goto BinaryTypeFixnumExceptions;
       
-    case DispatchLesspNoPopImmediate: AddressImmediateOperand (); goto ExecuteLesspNoPop;
+    case DispatchLesspNoPopImmediate: AddressImmediateOperand(); goto ExecuteLesspNoPop;
     case DispatchLesspNoPopSP: AddressSPOperand (); goto ExecuteLesspNoPop;
     case DispatchLesspNoPopFP: AddressFPOperand (); goto ExecuteLesspNoPop;
     case DispatchLesspNoPopLP: AddressLPOperand (); goto ExecuteLesspNoPop;
     case DispatchLesspNoPopPop: AddressPopOperand (); goto ExecuteLesspNoPop;
     ExecuteLesspNoPop:
     MARK(LesspNoPop);
+      { float x, y; if (SingleOperands(sp, op2, &x, &y)) {
+        PushPredicate(x < y); NextInstruction;
+      } }
       if (BinaryTypeFixnumP (op2->TAG, sp->TAG))
 	{
 	  /* --- Need some assembly hacking to check for overflow */
@@ -1568,6 +1609,9 @@ Dispatch:
     case DispatchPluspPop: AddressPopOperand (); goto ExecutePlusp;
       ExecutePlusp:
     MARK(Plusp);
+      if (TypeEqualP(op2->TAG, TypeSingleFloat)) {
+        PushPredicate(op2->DATA.f > 0); NextInstruction;
+      }
       if (TypeFixnumP (op2->TAG))
       {
 	PushPredicate (op2->DATA.s > 0);
@@ -1584,6 +1628,9 @@ Dispatch:
     case DispatchMinuspPop: AddressPopOperand (); goto ExecuteMinusp;
       ExecuteMinusp:
     MARK(Minusp);
+      if (TypeEqualP(op2->TAG, TypeSingleFloat)) {
+        PushPredicate(op2->DATA.f < 0); NextInstruction;
+      }
       if (TypeFixnumP (op2->TAG))
 	{
 	  PushPredicate (op2->DATA.s < 0);
@@ -1600,6 +1647,9 @@ Dispatch:
     case DispatchZeropPop: AddressPopOperand (); goto ExecuteZerop;
       ExecuteZerop:
     MARK(Zerop);
+      if (TypeEqualP(op2->TAG, TypeSingleFloat)) {
+        PushPredicate(op2->DATA.f == 0); NextInstruction;
+      }
       if (TypeFixnumP (op2->TAG))
 	{
 	  PushPredicate (op2->DATA.s == 0);
@@ -1615,8 +1665,9 @@ Dispatch:
     case DispatchAddPop: AddressPopOperand (); goto ExecuteAdd;
       ExecuteAdd:
     MARK(Add);
+      if (SingleArithmetic(OpcodeAdd, sp, op2)) NextInstruction;
       if (BinaryTypeFixnumP (op2->TAG, sp->TAG) &&
-	   ((i = sp->DATA.s + op2->DATA.s) >= sp->DATA.s) == (op2->DATA.s>=0))
+	   !__builtin_add_overflow(sp->DATA.s, op2->DATA.s, &i))
 	{
 	  sp->DATA.s = i;
 	  NextInstruction;
@@ -1631,8 +1682,9 @@ Dispatch:
     case DispatchSubPop: AddressPopOperand (); goto ExecuteSub;
       ExecuteSub:
     MARK(Sub);
+      if (SingleArithmetic(OpcodeSub, sp, op2)) NextInstruction;
       if (BinaryTypeFixnumP (op2->TAG, sp->TAG) &&
-	  ((i = sp->DATA.s - op2->DATA.s) <= sp->DATA.s) == (op2->DATA.s >= 0))
+	  !__builtin_sub_overflow(sp->DATA.s, op2->DATA.s, &i))
 	{
 	  sp->DATA.s = i;
 	  NextInstruction;
@@ -1649,8 +1701,12 @@ Dispatch:
     case DispatchUnaryMinusPop: AddressPopOperand (); goto ExecuteUnaryMinus;
       ExecuteUnaryMinus:
     MARK(UnaryMinus);
+      if (TypeEqualP(op2->TAG, TypeSingleFloat)) {
+        CObject value = *op2; value.DATA.u ^= UINT32_C(0x80000000);
+        PushObject(&value); NextInstruction;
+      }
       if (TypeFixnumP (op2->TAG) &&
-	  op2->DATA.s != (-1 << 31))
+	  op2->DATA.s != INT32_MIN)
 	{
 	  PushFixnum (-op2->DATA.s);
 	  NextInstruction;
@@ -1663,8 +1719,14 @@ Dispatch:
     case DispatchIncrementLP: AddressLPOperand (); goto ExecuteIncrement;
       ExecuteIncrement:
     MARK(Increment);
+      if (TypeEqualP(op2->TAG, TypeSingleFloat)) {
+        CObject one = COBJECT(TypeFixnum,1);
+        unsigned cdr = op2->TAG & TagCdrMask;
+        SingleArithmetic(OpcodeAdd, op2, &one);
+        op2->TAG |= cdr; NextInstruction;
+      }
       if (TypeFixnumP (op2->TAG) &&
-	  op2->DATA.s != ~(-1 << 31))
+	  op2->DATA.s != INT32_MAX)
 	{
 	  op2->DATA.s++;
 	  NextInstruction;
@@ -1677,8 +1739,14 @@ Dispatch:
     case DispatchDecrementLP: AddressLPOperand (); goto ExecuteDecrement;
       ExecuteDecrement:
     MARK(Decrement);
+      if (TypeEqualP(op2->TAG, TypeSingleFloat)) {
+        CObject one = COBJECT(TypeFixnum,1);
+        unsigned cdr = op2->TAG & TagCdrMask;
+        SingleArithmetic(OpcodeSub, op2, &one);
+        op2->TAG |= cdr; NextInstruction;
+      }
       if (TypeFixnumP (op2->TAG) &&
-	  op2->DATA.s != (-1 << 31))
+	  op2->DATA.s != INT32_MIN)
 	{
 	  op2->DATA.s--;
 	  NextInstruction;
@@ -1693,13 +1761,14 @@ Dispatch:
     case DispatchMultiplyPop: AddressPopOperand (); goto ExecuteMultiply;
     ExecuteMultiply:
     MARK(Multiply);
+      if (SingleArithmetic(OpcodeMultiply, sp, op2)) NextInstruction;
     {
       /* --- overflow-checking relies on 64-bit multiply */
       long value = (long) sp->DATA.s;
 
       if (BinaryTypeFixnumP (op2->TAG, sp->TAG) &&
-	   (value *= (long) op2->DATA.s) >= (int)(-1 << 31) &&
-           value <= ~(int)(-1 << 31))
+	   (value *= (long) op2->DATA.s) >= (int)INT32_MIN &&
+           value <= INT32_MAX)
 	{
 	  sp->DATA.s = (int) value;
 	  NextInstruction;
@@ -1715,13 +1784,14 @@ Dispatch:
     case DispatchQuotientPop: AddressPopOperand (); goto ExecuteQuotient;
     ExecuteQuotient:
     MARK(Quotient);
+      if (SingleArithmetic(OpcodeQuotient, sp, op2)) NextInstruction;
       if (BinaryTypeFixnumP (op2->TAG, sp->TAG))
 	{
           if (!op2->DATA.s)
 	    IllegalOperand;
-	  if (sp->DATA.s == (-1 << 31) && op2->DATA.s == -1)
+	  if (sp->DATA.s == INT32_MIN && op2->DATA.s == -1)
 	    InstructionException;
-	  sp->DATA.s = sp->DATA.s / op2->DATA.s;
+          sp->DATA.s = sp->DATA.s / op2->DATA.s;
 	  NextInstruction;
 	}
       goto BinaryTypeFixnumExceptions;
@@ -1733,13 +1803,18 @@ Dispatch:
     case DispatchFloorPop: AddressPopOperand (); goto ExecuteFloor;
     ExecuteFloor:
     MARK(Floor);
+      { CObject quotient,remainder;
+        if (SingleDivision(OpcodeFloor, sp, op2, &quotient, &remainder)) {
+          *sp = quotient; PushObject(&remainder); NextInstruction;
+        }
+      }
       if (BinaryTypeFixnumP (op2->TAG, sp->TAG))
 	{
 	  int quotient, remainder;
 	  
           if (!op2->DATA.s)
 	    IllegalOperand;
-	  if (sp->DATA.s == (-1 << 31) && op2->DATA.s == -1)
+	  if (sp->DATA.s == INT32_MIN && op2->DATA.s == -1)
 	    InstructionException;
 	  quotient  = sp->DATA.s / op2->DATA.s;
 	  remainder = sp->DATA.s - (op2->DATA.s * quotient);
@@ -1770,13 +1845,18 @@ Dispatch:
     case DispatchCeilingPop: AddressPopOperand (); goto ExecuteCeiling;
     ExecuteCeiling:
     MARK(Ceiling);
+      { CObject quotient,remainder;
+        if (SingleDivision(OpcodeCeiling, sp, op2, &quotient, &remainder)) {
+          *sp = quotient; PushObject(&remainder); NextInstruction;
+        }
+      }
       if (BinaryTypeFixnumP (op2->TAG, sp->TAG))
 	{
 	  int quotient, remainder;
 	  
           if (!op2->DATA.s)
 	    IllegalOperand;
-	  if (sp->DATA.s == (-1 << 31) && op2->DATA.s == -1)
+	  if (sp->DATA.s == INT32_MIN && op2->DATA.s == -1)
 	    InstructionException;
 	  quotient  = sp->DATA.s / op2->DATA.s;
 	  remainder = sp->DATA.s - (op2->DATA.s * quotient);
@@ -1806,13 +1886,18 @@ Dispatch:
     case DispatchTruncatePop: AddressPopOperand (); goto ExecuteTruncate;
     ExecuteTruncate:
     MARK(Truncate);
+      { CObject quotient,remainder;
+        if (SingleDivision(OpcodeTruncate, sp, op2, &quotient, &remainder)) {
+          *sp = quotient; PushObject(&remainder); NextInstruction;
+        }
+      }
       if (BinaryTypeFixnumP (op2->TAG, sp->TAG))
 	{
 	  int quotient, remainder;
 	  
           if (!op2->DATA.s)
 	    IllegalOperand;
-	  if (sp->DATA.s == (-1 << 31) && op2->DATA.s == -1)
+	  if (sp->DATA.s == INT32_MIN && op2->DATA.s == -1)
 	    InstructionException;
 	  quotient  = sp->DATA.s / op2->DATA.s;
 	  remainder = sp->DATA.s - (op2->DATA.s * quotient);
@@ -1829,29 +1914,24 @@ Dispatch:
     case DispatchRoundPop: AddressPopOperand (); goto ExecuteRound;
       ExecuteRound:
     MARK(Round);
-      if (BinaryTypeFixnumP (op2->TAG, sp->TAG))
-	{
-	  int quotient, remainder, temp;
-	  
-          if (!op2->DATA.s)
-	    IllegalOperand;
-	  if (sp->DATA.s == (-1 << 31) && op2->DATA.s == -1)
-	    InstructionException;
-	  quotient  = sp->DATA.s / op2->DATA.s;
-	  remainder = sp->DATA.s - (op2->DATA.s * quotient);
-          temp = op2->DATA.s - remainder - remainder;
-	  if ((!temp)?(quotient&1):((op2->DATA.s>0)?(temp<0):(temp>0)))
-	    { 
-	      SetFixnum (quotient + 1);
-	      PushFixnum (remainder - op2->DATA.s);
-	    }
-	  else
-	    {
-	      SetFixnum (quotient);
-	      PushFixnum (remainder);
-	    }
-	  NextInstruction;
-	}
+      { CObject quotient,remainder;
+        if (SingleDivision(OpcodeRound, sp, op2, &quotient, &remainder)) {
+          *sp = quotient; PushObject(&remainder); NextInstruction;
+        }
+      }
+      if (BinaryTypeFixnumP(op2->TAG, sp->TAG)) {
+        int64_t x = sp->DATA.s, y = op2->DATA.s;
+        if (!y) IllegalOperand;
+        int64_t q = x / y, r = x % y;
+        int64_t twice = llabs(r) * 2, divisor = llabs(y);
+        if (twice > divisor || (twice == divisor && (q & 1))) {
+          int direction = (x < 0) != (y < 0) ? -1 : 1;
+          q += direction; r -= direction * y;
+        }
+        if (q < INT32_MIN || q > INT32_MAX) InstructionException;
+        SetFixnum(q); PushFixnum(r);
+        NextInstruction;
+      }
       goto BinaryTypeFixnumExceptions;
       
     /* --- maybe hack single-float */
@@ -1862,13 +1942,14 @@ Dispatch:
     case DispatchRationalQuotientPop: AddressPopOperand (); goto ExecuteRationalQuotient;
       ExecuteRationalQuotient:
     MARK(RationalQuotient);
+      if (SingleArithmetic(OpcodeRationalQuotient, sp, op2)) NextInstruction;
       if (BinaryTypeFixnumP(sp->TAG, op2->TAG))
         {
 	  int quotient, remainder;
 
           if (!op2->DATA.s)
 	    IllegalOperand;
-	  if (sp->DATA.s == (-1 << 31) && op2->DATA.s == -1)
+	  if (sp->DATA.s == INT32_MIN && op2->DATA.s == -1)
 	    InstructionException;
 	  quotient  = sp->DATA.s / op2->DATA.s;
 	  remainder = sp->DATA.s - (op2->DATA.s * quotient);
@@ -1888,6 +1969,10 @@ Dispatch:
     case DispatchMaxPop: AddressPopOperand (); goto ExecuteMax;
     ExecuteMax:
     MARK(Max);
+      { float x,y; if (SingleOperands(sp, op2, &x, &y)) {
+        if (y > x) SetObject(op2);
+        NextInstruction;
+      } }
       if (BinaryTypeFixnumP (op2->TAG, sp->TAG))
 	{
 	  if (op2->DATA.s > sp->DATA.s)
@@ -1904,6 +1989,10 @@ Dispatch:
     case DispatchMinPop: AddressPopOperand (); goto ExecuteMin;
     ExecuteMin:
     MARK(Min);
+      { float x,y; if (SingleOperands(sp, op2, &x, &y)) {
+        if (y < x) SetObject(op2);
+        NextInstruction;
+      } }
       if (BinaryTypeFixnumP (op2->TAG, sp->TAG))
 	{
 	  if (op2->DATA.s < sp->DATA.s)
@@ -1961,24 +2050,18 @@ Dispatch:
     case DispatchAshPop: AddressPopOperand (); goto ExecuteAsh;
     ExecuteAsh:
     MARK(Ash);
-      if (BinaryTypeFixnumP (op2->TAG, sp->TAG))
-	{
-	  int places = op2->DATA.s;
-	  
-     	  if (places == 0  || sp->DATA.s == 0)
-	    NextInstruction;
-	  else if (places > 0)
-	    {
-	      if ((sp->DATA.s < 0) == ((i = sp->DATA.s << places) < 0) &&
-	          i != 0)
-		SetFixnum (i)
-	      else
-		InstructionException;
-            }
-          else
-	    SetFixnum (sp->DATA.s >> (- places));
-	  NextInstruction;
-	}
+      if (BinaryTypeFixnumP(op2->TAG, sp->TAG)) {
+        int32_t places = op2->DATA.s;
+        if (places > 0 && sp->DATA.s) {
+          if (places >= 32) InstructionException;
+          int64_t result = (int64_t)sp->DATA.s * (INT64_C(1) << places);
+          if (result < INT32_MIN || result > INT32_MAX) InstructionException;
+          sp->DATA.s = result;
+        } else if (places < 0) {
+          sp->DATA.s >>= places <= -32 ? 31 : -places;
+        }
+        NextInstruction;
+      }
       goto BinaryTypeFixnumExceptions;
       
     case DispatchLshImmediate: AddressImmediateOperand (); goto ExecuteLsh;
@@ -2075,7 +2158,10 @@ Dispatch:
     case DispatchMultiplyDoublePop: AddressPopOperand (); goto ExecuteMultiplyDouble;
       ExecuteMultiplyDouble:
     MARK(MultiplyDouble);
-      UnimplementedInstruction;
+      if (!BinaryTypeFixnumP(op2->TAG, sp->TAG)) IllegalOperand;
+      { int64_t n = (int64_t)sp->DATA.s * op2->DATA.s;
+        SetFixnum((uint32_t)n); PushFixnum((uint64_t)n >> 32); }
+      NextInstruction;
       
     case DispatchAddBignumStepImmediate: AddressImmediateOperand (); goto ExecuteAddBignumStep;
     case DispatchAddBignumStepSP: AddressSPOperand (); goto ExecuteAddBignumStep;
@@ -2084,7 +2170,10 @@ Dispatch:
     case DispatchAddBignumStepPop: AddressPopOperand (); goto ExecuteAddBignumStep;
       ExecuteAddBignumStep:
     MARK(AddBignumStep);
-      UnimplementedInstruction;
+      if (!BinaryTypeFixnumP(op2->TAG, sp->TAG) || !TypeFixnumP(sp[-1].TAG)) IllegalOperand;
+      { uint64_t n = (uint64_t)sp[-1].DATA.u + sp->DATA.u + op2->DATA.u;
+        sp[-1].DATA.u = n; sp->DATA.u = n >> 32; }
+      NextInstruction;
       
     case DispatchSubBignumStepImmediate: AddressImmediateOperand (); goto ExecuteSubBignumStep;
     case DispatchSubBignumStepSP: AddressSPOperand (); goto ExecuteSubBignumStep;
@@ -2093,7 +2182,11 @@ Dispatch:
     case DispatchSubBignumStepPop: AddressPopOperand (); goto ExecuteSubBignumStep;
       ExecuteSubBignumStep:
     MARK(SubBignumStep);
-      UnimplementedInstruction;
+      if (!BinaryTypeFixnumP(op2->TAG, sp->TAG) || !TypeFixnumP(sp[-1].TAG)) IllegalOperand;
+      { uint32_t a = sp[-1].DATA.u, b = sp->DATA.u, c = op2->DATA.u;
+        uint32_t d = a - b;
+        sp[-1].DATA.u = d - c; sp->DATA.u = (a < b) + (d < c); }
+      NextInstruction;
       
     case DispatchMultiplyBignumStepImmediate: AddressImmediateOperand (); goto ExecuteMultiplyBignumStep;
     case DispatchMultiplyBignumStepSP: AddressSPOperand (); goto ExecuteMultiplyBignumStep;
@@ -2104,7 +2197,7 @@ Dispatch:
     MARK(MultiplyBignumStep);
       if (BinaryTypeFixnumP (op2->TAG, sp->TAG))
 	{
-	  long value = (long)op2->DATA.u * (long)sp->DATA.u;
+	  uint64_t value = (uint64_t)op2->DATA.u * sp->DATA.u;
 	  unsigned int low = value & 0xFFFFFFFFL,
 		       high = (value >> 32) & 0xFFFFFFFFL;
 	  SetFixnum (*(int*)&low);
@@ -2122,9 +2215,10 @@ Dispatch:
     MARK(DivideBignumStep);
       if (BinaryTypeFixnumP (op2->TAG, sp->TAG) && TypeFixnumP(sp[-1].TAG))
       {
-        long dividend = (sp->DATA.u << 32) | sp[-1].DATA.u;
-	long divisor = (long)op2->DATA.u;
-        long quotient = dividend / divisor;
+        uint64_t dividend = ((uint64_t)sp->DATA.u << 32) | sp[-1].DATA.u;
+	uint64_t divisor = op2->DATA.u;
+        if (!divisor) IllegalOperand;
+        uint64_t quotient = dividend / divisor;
 
         if (quotient>>32) IllegalOperand;
         sp[-1].DATA.u = (unsigned int)quotient;
@@ -2140,7 +2234,11 @@ Dispatch:
     case DispatchLshcBignumStepPop: AddressPopOperand (); goto ExecuteLshcBignumStep;
       ExecuteLshcBignumStep:
     MARK(LshcBignumStep);
-      UnimplementedInstruction;
+      if (!BinaryTypeFixnumP(op2->TAG, sp->TAG) || !TypeFixnumP(sp[-1].TAG)) IllegalOperand;
+      { uint64_t n = ((uint64_t)sp->DATA.u << 32) | sp[-1].DATA.u;
+        unsigned shift = op2->DATA.u & 63;
+        --sp; SetFixnum((n << shift) >> 32); }
+      NextInstruction;
       
     case DispatchPushImmediate: 
       PushFixnum(cp->operand);
@@ -2162,10 +2260,12 @@ Dispatch:
     case DispatchPushNNils:
       i = cp->operand;
       PushNNilsInternal:
+      DecacheRegisters();
+      EnsureStackCacheSpace(i);
+      EncacheRegisters();
       for (; i--; )
         { 
 	  PushNIL();
-	  /* --- Check for stack overflow */
         }
       NextInstruction;
 
@@ -2246,11 +2346,10 @@ Dispatch:
       if (TypeFixnumP (sp->TAG))
       {
 	/* Bottom 5 bits are pp, next 5 are ss - 1 */
-	short pp = (32 - cp->operand) & 0x1F;
 	short ss = ((cp->operand >> 5) & 0x1F);
 
 	/* replace x with result */
-	SetFixnum ((sp->DATA.s >> pp) & ~(-2 << ss));
+	SetFixnum (RotateLeft(sp->DATA.u, cp->operand & 31) & CMask(ss + 1));
 	NextInstruction;
       }
       goto SpFixnumExceptions;
@@ -2261,7 +2360,7 @@ Dispatch:
 	short pp = (32 - cp->operand) & 0x1F;
 	short ss = ((cp->operand >> 5) & 0x1F);
 
-	SetFixnum ((sp->DATA.s >> pp) & ~(-2 << ss));
+	SetFixnum ((sp->DATA.u >> pp) & CMask(ss + 1));
 	NextInstruction;
       }
       goto SpSpareExceptions;
@@ -2277,14 +2376,14 @@ Dispatch:
       {
 	short pp = (32 - cp->operand) & 0x1F;
 	short ss = ((cp->operand >> 5) & 0x1F);
-	LispObj word_rep;
-	LispObj *word = &word_rep;
+	CObject word_rep;
+	CObject *word = &word_rep;
 	
 	/* don't care what type the word is */
-	ReadVirtualMemory(sp->DATA.s, word);
+	CReadVirtualMemory(sp->DATA.s, word);
 
 	/* replace ptr with result */
-	SetFixnum ((word->DATA.s >> pp) & ~(-2 << ss));
+	SetFixnum ((word->DATA.u >> pp) & CMask(ss + 1));
 	NextInstruction;
       }
       
@@ -2294,14 +2393,14 @@ Dispatch:
       {
 	short pp = (32 - cp->operand) & 0x1F;
 	short ss = ((cp->operand >> 5) & 0x1F);
-	LispObj word_rep;
-	LispObj *word = &word_rep;
+	CObject word_rep;
+	CObject *word = &word_rep;
 	
 	/* don't care what type the word is */
-	ReadVirtualMemory(sp->DATA.u, word);
+	CReadVirtualMemory(sp->DATA.u, word);
 
 	/* replace ptr with result loaded from tag*/
-	SetFixnum ((word->TAG >> pp) & ~(-2 << ss));
+	SetFixnum ((word->TAG >> pp) & CMask(ss + 1));
 	NextInstruction;
       }
      
@@ -2320,7 +2419,7 @@ Dispatch:
 	unsigned int newbyte_mask;
 	
 	sp--;
-	newbyte_mask = ((unsigned int )~(-2 << ss)) << pp;
+	newbyte_mask = ((unsigned int )CMask(ss + 1)) << pp;
 	sp[0].DATA.u = (sp[1].DATA.u & (~newbyte_mask)) | 
 		       ((sp[0].DATA.u << pp) & newbyte_mask);
 	NextInstruction;
@@ -2340,7 +2439,7 @@ Dispatch:
 	unsigned int newbyte_mask;
 	
 	sp--;
-	newbyte_mask = ((unsigned int )~(-2 << ss)) << pp;
+	newbyte_mask = ((unsigned int )CMask(ss + 1)) << pp;
 	sp[0].DATA.u = (sp[1].DATA.u & (~newbyte_mask)) | 
 		       ((sp[0].DATA.u << pp) & newbyte_mask);
 	sp[0].TAG = TypeCharacter;
@@ -2365,11 +2464,11 @@ Dispatch:
 	unsigned int newbyte_mask;
 	
 	sp -= 2;
-	ReadVirtualMemory(sp[2].DATA.u, scratch);
-	newbyte_mask = ((unsigned int )~(-2 << ss)) << pp;
+	CReadVirtualMemory(sp[2].DATA.u, scratch);
+	newbyte_mask = ((unsigned int )CMask(ss + 1)) << pp;
 	scratch->DATA.u = (scratch->DATA.u & (~newbyte_mask)) | 
 			  ((sp[1].DATA.u << pp) & newbyte_mask);
-	WriteVirtualMemory(sp[2].DATA.u, scratch);
+	CWriteVirtualMemory(sp[2].DATA.u, scratch);
 	/* returns no values */
 	NextInstruction;
       }
@@ -2385,11 +2484,11 @@ Dispatch:
 	unsigned int newbyte_mask;
 	
 	sp -= 2;
-	ReadVirtualMemory(sp[2].DATA.u, scratch);
-	newbyte_mask = ((unsigned int )~(-2 << ss)) << pp;
+	CReadVirtualMemory(sp[2].DATA.u, scratch);
+	newbyte_mask = ((unsigned int )CMask(ss + 1)) << pp;
 	scratch->TAG = (scratch->TAG & (~newbyte_mask)) | 
 		       ((sp[1].DATA.u << pp) & newbyte_mask);
-	WriteVirtualMemory(sp[2].DATA.u, scratch);
+	CWriteVirtualMemory(sp[2].DATA.u, scratch);
 	/* returns no values */
 	NextInstruction;
       }
@@ -2404,7 +2503,7 @@ Dispatch:
       if (!TypeFixnumP (op2->TAG)) IllegalOperand;
       if (TypeArrayP(sp->TAG))
       {
-	LispObj header;
+	CObject header;
 	Integer vma;
       
 	vma = MemoryReadHeader (sp->DATA.u, &header);
@@ -2430,7 +2529,7 @@ Dispatch:
       if (!TypeFixnumP (op2->TAG)) IllegalOperand;
       if (TypeArrayP(sp->TAG))
       {
-	LispObj header;
+	CObject header;
 	Integer vma;
       
 	vma = MemoryReadHeader (sp->DATA.u, &header);
@@ -2457,7 +2556,7 @@ Dispatch:
       if (!TypeFixnumP (op2->TAG)) IllegalOperand;
       if (TypeArrayP(sp->TAG))
       {
-	LispObj header; 
+	CObject header;
         Integer vma;
   
 	vma = MemoryReadHeader (sp->DATA.u, &header);
@@ -2475,14 +2574,14 @@ Dispatch:
       goto SpArrayExceptions;
       
     case DispatchSetup1dArrayImmediate:
-      UnimplementedInstruction;
+      IllegalOperand;
     case DispatchSetup1dArraySP: AddressSPOperand (); goto ExecuteSetup1dArray;
     case DispatchSetup1dArrayFP: AddressFPOperand (); goto ExecuteSetup1dArray;
     case DispatchSetup1dArrayLP: AddressLPOperand (); goto ExecuteSetup1dArray;
     case DispatchSetup1dArrayPop: AddressPopOperand (); goto ExecuteSetup1dArray;
 
     case DispatchSetupForce1dArrayImmediate:
-      UnimplementedInstruction;
+      IllegalOperand;
     /* Believe it or not, setup-force-1d-array really wants do exactly 
      * the same thing as setup-1d-array.  They both trap for interesting
      * arrays, and the trap-handlers do subtly different things, based on
@@ -2502,7 +2601,7 @@ Dispatch:
        */
       if (TypeArrayP(op2->TAG))
       {
-	LispObj header;
+	CObject header;
         Integer vma;
 
         vma = MemoryReadHeader(op2->DATA.u, &header);
@@ -2597,7 +2696,7 @@ Dispatch:
       if (!TypeFixnumP(op2->TAG)) IllegalOperand;
       if (TypeArrayP(sp->TAG))
       {
-	LispObj header, q;
+	CObject header, q;
 	Integer vma;
       
 	vma = MemoryReadHeader (sp[0].DATA.u, &header);
@@ -2627,7 +2726,7 @@ Dispatch:
       if (!TypeFixnumP(op2->TAG)) IllegalOperand;
       if (TypeArrayP(sp->TAG))
       {
-	LispObj header;
+	CObject header;
 	Integer vma;
       
 	vma = MemoryReadHeader (sp[0].DATA.u, &header);
@@ -2656,7 +2755,7 @@ Dispatch:
       if (!TypeFixnumP(op2->TAG)) IllegalOperand;
       if (TypeArrayP(sp->TAG))
       {
-	LispObj header; 
+	CObject header;
         Integer vma;
   
 	vma = MemoryReadHeader (sp[0].DATA.u, &header);
@@ -2705,7 +2804,7 @@ Dispatch:
       
     case DispatchLoopDecrementTos:
       if (TypeFixnumP (sp->TAG) &&
-	   (i = sp->DATA.s - 1) < sp->DATA.s)
+	   !__builtin_sub_overflow(sp->DATA.s, 1, &i))
 	{
 	  sp->TAG = TypeFixnum;		/* clear counter cdr-code */
 	  if ((sp->DATA.s = i) > 0) TakeBranch(0); DontTakeBranch(0);
@@ -2713,8 +2812,8 @@ Dispatch:
       if (TypeNumericP (sp->TAG))
     FollowPCInstructionException:
       {
-        /* Exceptions see followed PC as continuation */
-        LispObj next_pc = pc;
+        /* Exceptions see followed CPC as continuation */
+        CObject next_pc = pc;
 
         IncrementPC(&next_pc, cp->operand);
 	DecacheRegisters();
@@ -2729,17 +2828,18 @@ Dispatch:
     case DispatchLoopIncrementTosLessThan:
       op2 = sp - 1;
       if (BinaryTypeFixnumP (op2->TAG, sp->TAG) &&
-           (i = sp->DATA.s + 1) > sp->DATA.s)
+           !__builtin_add_overflow(sp->DATA.s, 1, &i))
         {
 	  sp->TAG = TypeFixnum;		/* clear counter cdr-code */
 	  if ((sp->DATA.s = i) <= op2->DATA.s) TakeBranch(0); DontTakeBranch(0);
         }
       if BinaryTypeNumericP (op2->TAG, sp->TAG)
-        /* Exceptions see followed PC */
+        /* Exceptions see followed CPC */
 	goto FollowPCInstructionException;
       else
 	IllegalOperand;
       
+    case DispatchBlock0Read: AddressBAR(0); goto ExecuteBlockRead;
     case DispatchBlock1Read: AddressBAR (1); goto ExecuteBlockRead;
     case DispatchBlock2Read: AddressBAR (2); goto ExecuteBlockRead;
     case DispatchBlock3Read: AddressBAR (3); goto ExecuteBlockRead;
@@ -2751,35 +2851,63 @@ Dispatch:
 	int cdr_next = (cp->operand & 020); 
 	Integer vma = bar->address.DATA.u;
 
-	MemoryRead (vma,&sp[1],cycle);
+	if (cycle > CycleRawTranslate) IllegalOperand;
+        vma = MemoryRead(vma, &sp[1], cycle);
 	if (fixnum_only && !TypeFixnumP(sp[1].TAG))
 	  InstructionException;
 	sp++;
 	if (cdr_next)
 	  sp->TAG = TagType(sp->TAG);
-	if (!(cp->operand & 0x004))
-	  bar->address.DATA.u++;
+	bar->address.DATA.u = vma + !(cp->operand & 4);
 	NextInstruction;
       }
       
+    case DispatchBlock0ReadShift: AddressBAR(0); goto ExecuteBlockReadShift;
     case DispatchBlock1ReadShift: AddressBAR (1); goto ExecuteBlockReadShift;
     case DispatchBlock2ReadShift: AddressBAR (2); goto ExecuteBlockReadShift;
     case DispatchBlock3ReadShift: AddressBAR (3); goto ExecuteBlockReadShift;
       ExecuteBlockReadShift:
     MARK(BlockReadShift);
-      UnimplementedInstruction;
+      {
+        unsigned cycle = (cp->operand >> 6) & 15;
+        if (cycle > CycleRawTranslate) IllegalOperand;
+        Integer vma = MemoryRead(bar->address.DATA.u, scratch, cycle);
+        if ((cp->operand & 040) && !TypeFixnumP(scratch->TAG)) IllegalOperand;
+        if (cp->operand & 020) scratch->TAG &= TagTypeMask;
+        scratch->DATA.u = ALUFunctionByte((1u << 10) | (1u << 12), 0, scratch->DATA.u);
+        bar->address.DATA.u = vma + !(cp->operand & 4);
+        sp[1] = *scratch; ++sp;
+        NextInstruction;
+      }
       
+    case DispatchBlock0ReadTest: AddressBAR(0); goto ExecuteBlockReadTest;
     case DispatchBlock1ReadTest: AddressBAR (1); goto ExecuteBlockReadTest;
     case DispatchBlock2ReadTest: AddressBAR (2); goto ExecuteBlockReadTest;
     case DispatchBlock3ReadTest: AddressBAR (3); goto ExecuteBlockReadTest;
       ExecuteBlockReadTest:
     MARK(BlockReadTest);
-      UnimplementedInstruction;
+      {
+        unsigned cycle = (cp->operand >> 6) & 15;
+        if (cycle > CycleRawTranslate) IllegalOperand;
+        Integer vma = MemoryRead(bar->address.DATA.u, scratch, cycle);
+        if ((cp->operand & 040) && !BinaryTypeFixnumP(scratch->TAG, sp->TAG)) IllegalOperand;
+        if (cp->operand & 020) scratch->TAG &= TagTypeMask;
+        ps->ALUOverflow = 0;
+        Integer result = ps->AluOp(ps->AluAndRotateControl, scratch->DATA.u, sp->DATA.u);
+        if (ALUComputeCondition(ps->AluAndRotateControl, scratch, sp, result) ^ ldb(1,21,ps->AluAndRotateControl)) {
+          pc = sp[-1]; goto InstructionCacheLookup;
+        }
+        bar->address.DATA.u = vma + !(cp->operand & 4);
+        NextInstruction;
+      }
       
+    case DispatchBlock0ReadAluSP: AddressSPOperand(); AddressBAR(0); goto ExecuteBlockReadAlu;
     case DispatchBlock1ReadAluSP:
       AddressSPOperand (); AddressBAR (1); goto ExecuteBlockReadAlu;
+    case DispatchBlock0ReadAluFP: AddressFPOperand(); AddressBAR(0); goto ExecuteBlockReadAlu;
     case DispatchBlock1ReadAluFP:
       AddressFPOperand (); AddressBAR (1); goto ExecuteBlockReadAlu;
+    case DispatchBlock0ReadAluLP: AddressLPOperand(); AddressBAR(0); goto ExecuteBlockReadAlu;
     case DispatchBlock1ReadAluLP:
       AddressLPOperand (); AddressBAR (1); goto ExecuteBlockReadAlu;
     case DispatchBlock2ReadAluSP:
@@ -2796,14 +2924,26 @@ Dispatch:
       AddressLPOperand (); AddressBAR (3); goto ExecuteBlockReadAlu;
       ExecuteBlockReadAlu:
     MARK(BlockReadAlu);
-      UnimplementedInstruction;
+      {
+        Integer vma = MemoryReadData(bar->address.DATA.u, scratch);
+        if (!BinaryTypeFixnumP(op2->TAG, scratch->TAG)) IllegalOperand;
+        ps->ALUOverflow = 0;
+        op2->DATA.u = ps->AluOp(ps->AluAndRotateControl, scratch->DATA.u, op2->DATA.u);
+        bar->address.DATA.u = vma + 1;
+        NextInstruction;
+      }
       
+    case DispatchBlock0WriteImmediate: AddressImmediateOperand(); AddressBAR(0); goto ExecuteBlockWrite;
     case DispatchBlock1WriteImmediate: AddressImmediateOperand (); AddressBAR (1); goto ExecuteBlockWrite;
     case DispatchBlock2WriteImmediate: AddressImmediateOperand (); AddressBAR (2); goto ExecuteBlockWrite;
     case DispatchBlock3WriteImmediate: AddressImmediateOperand (); AddressBAR (3); goto ExecuteBlockWrite;
+    case DispatchBlock0WriteSP: AddressSPOperand(); AddressBAR(0); goto ExecuteBlockWrite;
     case DispatchBlock1WriteSP: AddressSPOperand (); AddressBAR (1); goto ExecuteBlockWrite;
+    case DispatchBlock0WriteFP: AddressFPOperand(); AddressBAR(0); goto ExecuteBlockWrite;
     case DispatchBlock1WriteFP: AddressFPOperand (); AddressBAR (1); goto ExecuteBlockWrite;
+    case DispatchBlock0WriteLP: AddressLPOperand(); AddressBAR(0); goto ExecuteBlockWrite;
     case DispatchBlock1WriteLP: AddressLPOperand (); AddressBAR (1); goto ExecuteBlockWrite;
+    case DispatchBlock0WritePop: AddressPopOperand(); AddressBAR(0); goto ExecuteBlockWrite;
     case DispatchBlock1WritePop: AddressPopOperand (); AddressBAR (1); goto ExecuteBlockWrite;
     case DispatchBlock2WriteSP: AddressSPOperand (); AddressBAR (2); goto ExecuteBlockWrite;
     case DispatchBlock2WriteFP: AddressFPOperand (); AddressBAR (2); goto ExecuteBlockWrite;
@@ -2815,7 +2955,7 @@ Dispatch:
     case DispatchBlock3WritePop: AddressPopOperand (); AddressBAR (3); goto ExecuteBlockWrite;
       ExecuteBlockWrite:
     MARK(BlockWrite);
-      WriteVirtualMemory(bar->address.DATA.u, op2);
+      CWriteVirtualMemory(bar->address.DATA.u, op2);
       bar->address.DATA.u++;
       NextInstruction;
       
@@ -2860,6 +3000,25 @@ Dispatch:
       StartCallDispatch:
       switch (TagType(scratch->TAG))
       {
+      case TypeSymbol:
+        MemoryReadData(scratch->DATA.u + 2, scratch);
+        goto StartCallDispatch;
+
+      case TypeGenericFunction:
+      case TypeInstance:
+        {
+          Integer entry = TrapVectorBase +
+            (TypeEqualP(scratch->TAG, TypeGenericFunction) ?
+             GenericDispatchTrapVector : MessageDispatchTrapVector);
+          PushContinuation(ps->continuation);
+          PushControl(ps->control);
+          PushObject(scratch);
+          ps->control |= ControlCallStarted | ControlExtraArgument;
+          ps->continuation.TAG = TypeEvenPC;
+          ps->continuation.DATA.u = entry;
+          NextInstruction;
+        }
+
       case TypeCompiledFunction:
 	PushContinuation (ps->continuation);
 	PushControl (ps->control);
@@ -2870,7 +3029,7 @@ Dispatch:
 
       case TypeLexicalClosure:
 	{
-	  LispObj environment, function;
+	  CObject environment, function;
 
 	  MemoryReadData (scratch->DATA.u, &environment);
 	  MemoryReadData (scratch->DATA.u + 1, &function);
@@ -2884,11 +3043,14 @@ Dispatch:
 	      ps->continuation.DATA.u = function.DATA.u;
 	      NextInstruction;
 	    }
+
+          *scratch = function;
+          goto StartCallDispatch;
 	}
 
       default:
         {
-           LispObj InterpreterFunction;
+           CObject InterpreterFunction;
  
            MemoryReadData(TrapVectorBase + InterpreterFunctionVector + TagType(scratch->TAG),
                            &InterpreterFunction);
@@ -2999,6 +3161,9 @@ Dispatch:
       lp = op2;
       pc = ps->continuation;
       ps->continuation = cp->next_pc;
+      DecacheRegisters();
+      if (!CheckControlStack(0)) goto halt;
+      EncacheRegisters();
       if (fp > ps->StackCacheLimit)
 	{
 	  DecacheRegisters();
@@ -3046,7 +3211,7 @@ Dispatch:
 	       goto applynil;
 	      case TypeList:
 	       i = maximum - supplied;
-	       if ((sp[0].DATA.u - ps->StackCacheBase) < StackCacheSize * PageSize)
+	       if ((sp[0].DATA.u - ps->StackCacheBase) < c_processor->StackCacheOverflowLimit)
 	       {
 		 DecacheRegisters();
 		 i = PullApplyArgsQuickly(i);
@@ -3106,7 +3271,7 @@ Dispatch:
 	  if (TypeEqualP (sp->TAG, TypeList))
 	  {
 	    i = maximum - supplied;
-	    if ((sp[0].DATA.u - ps->StackCacheBase) < StackCacheSize * PageSize)
+	    if ((sp[0].DATA.u - ps->StackCacheBase) < c_processor->StackCacheOverflowLimit)
 	    {
 	      DecacheRegisters();
 	      i = PullApplyArgsQuickly(maximum - supplied);
@@ -3158,7 +3323,6 @@ Dispatch:
 	IvoryValueDisposition disp;
         Integer control;
 	
-      retryReturnSingle:
         disp = ReadControlValueDisposition (ps->control);
         control = fp[1].DATA.u;
 
@@ -3171,7 +3335,7 @@ Dispatch:
           for (; ReadControlCleanupCatch (ps->control); )
           {
 	    /* cbp[0] == pc, cbp[1] == binding stack, cbp[2] == previous */
-	    LispObj *cbp = &ps->StackCache[ps->CatchBlockPointer.DATA.u - ps->StackCacheBase];
+	    CObject *cbp = &ps->StackCache[ps->CatchBlockPointer.DATA.u - ps->StackCacheBase];
             Integer control = ps->control;
 
             if (ldb(1,6,cbp[1].TAG))
@@ -3183,12 +3347,12 @@ Dispatch:
           if (ReadControlCleanupBindings (ps->control))
 	  {
 	    if (ps->DeepBoundP)
-	      UnimplementedInstruction;
+              TakeMemoryTrap(DBUnwindFrameTrapVector, 0);
 	    for (; ReadControlCleanupBindings (ps->control); )
               Unbind();
 	  }
 	  if (ReadControlTrapOnExit (ps->control))
-            IllegalOperand;
+            TakeErrorTrap(79, 0); /* trap-on-exit microstate */
         }
 	/* --- debug
 	if (TypeEqualP (fp[0].TAG, TypeNIL))
@@ -3201,6 +3365,7 @@ Dispatch:
 	fp = fp - ReadControlCallerFrameSize (ps->control);
 	lp = fp + ReadControlArgumentSize (control);
 	ps->control = control;
+	CRequestPreemptCheck();
 	
 	switch (disp)
 	{
@@ -3217,6 +3382,8 @@ Dispatch:
             break;
 
 	  case ValueDispositionReturn:
+            if (cp->code == DispatchReturnSingleTOS)
+              PushObject(scratch);
             break;
 	}
 	if (fp < ps->StackCache)
@@ -3225,14 +3392,12 @@ Dispatch:
 	    StackCacheScrollDown();      
 	    EncacheRegisters();
 	  }
-        if (disp == ValueDispositionReturn)
-	{	
-	  AllowSequenceBreaks;
-          goto retryReturnSingle;
-	}
         goto InstructionCacheLookup;
       }
       
+    case DispatchReturnMultipleFP: AddressFPOperand(); goto ExecuteReturnMultiple;
+    case DispatchReturnMultipleLP: AddressLPOperand(); goto ExecuteReturnMultiple;
+    case DispatchReturnMultipleSP: AddressSPOperand(); goto ExecuteReturnMultiple;
     case DispatchReturnMultipleImmediate:  AddressImmediateOperand (); goto ExecuteReturnMultiple;
     case DispatchReturnMultiplePop: AddressPopOperand (); goto ExecuteReturnMultiple;
     ExecuteReturnMultiple:
@@ -3244,9 +3409,7 @@ Dispatch:
 	IvoryValueDisposition disp;
         int framesize;
 	Integer control;
-        LispObj *valueblock;
-
-      retryReturnMultiple:
+        CObject *valueblock;
 
         /* --- debug
         if ((fp[-ReadControlCallerFrameSize(ps->control)].TAG&-2) != ((TypeEvenPC&-2)|(3<<6)))
@@ -3265,7 +3428,7 @@ Dispatch:
           for (; ReadControlCleanupCatch (ps->control); )
           {
 	    /* cbp[0] == pc, cbp[1] == binding stack, cbp[2] == previous */
-	    LispObj *cbp = &ps->StackCache[ps->CatchBlockPointer.DATA.u - ps->StackCacheBase];
+	    CObject *cbp = &ps->StackCache[ps->CatchBlockPointer.DATA.u - ps->StackCacheBase];
             Integer control = ps->control;
 
             if (ldb(1,6,cbp[1].TAG))
@@ -3277,12 +3440,12 @@ Dispatch:
           if (ReadControlCleanupBindings (ps->control))
 	  {
 	    if (ps->DeepBoundP)
-	      UnimplementedInstruction;
+              TakeMemoryTrap(DBUnwindFrameTrapVector, 0);
 	    for (; ReadControlCleanupBindings (ps->control); )
               Unbind();
 	  }
 	  if (ReadControlTrapOnExit (ps->control))
-            IllegalOperand;
+            TakeErrorTrap(79, 0);
         }
 
         /* --- debug
@@ -3296,6 +3459,7 @@ Dispatch:
 	fp -= framesize;
 	lp = fp + ReadControlArgumentSize (control);	/* from new control */
 	ps->control = control; 				/* --- trace-pending is sticky? */
+	CRequestPreemptCheck();
       switch (disp)
       {
         case ValueDispositionEffect:
@@ -3325,12 +3489,16 @@ Dispatch:
 	 }
        if (disp == ValueDispositionReturn)
        {
-	 AllowSequenceBreaks;
-         goto retryReturnMultiple;
+         /* Re-execute in the caller with a fresh restart SP.  Unwind-protect
+            cleanup must see the returned values (and the popped count). */
+         if (cp->code == DispatchReturnMultiplePop) PushFixnum(count);
        }
        goto InstructionCacheLookup;
       }
       
+    case DispatchReturnKludgeFP: AddressFPOperand(); goto ExecuteReturnKludge;
+    case DispatchReturnKludgeLP: AddressLPOperand(); goto ExecuteReturnKludge;
+    case DispatchReturnKludgeSP: AddressSPOperand(); goto ExecuteReturnKludge;
     case DispatchReturnKludgeImmediate: AddressImmediateOperand (); goto ExecuteReturnKludge;
     case DispatchReturnKludgePop: AddressPopOperand (); goto ExecuteReturnKludge;
     ExecuteReturnKludge:
@@ -3340,7 +3508,7 @@ Dispatch:
 	int count = op2->DATA.s;
         int framesize = ReadControlCallerFrameSize (ps->control);
         Integer control = fp[1].DATA.u;
-        LispObj *valueblock = &sp[-(count - 1)];
+        CObject *valueblock = &sp[-(count - 1)];
 
         if (framesize + count + 1 > 112)
 	  IllegalOperand;
@@ -3349,7 +3517,7 @@ Dispatch:
           for (; ReadControlCleanupCatch (ps->control); )
           {
 	    /* cbp[0] == pc, cbp[1] == binding stack, cbp[2] == previous */
-	    LispObj *cbp = &ps->StackCache[ps->CatchBlockPointer.DATA.u - ps->StackCacheBase];
+	    CObject *cbp = &ps->StackCache[ps->CatchBlockPointer.DATA.u - ps->StackCacheBase];
             Integer control = ps->control;
 
             if (ldb(1,6,cbp[1].TAG))
@@ -3361,12 +3529,12 @@ Dispatch:
           if (ReadControlCleanupBindings (ps->control))
 	  {
 	    if (ps->DeepBoundP)
-	      UnimplementedInstruction;
+              TakeMemoryTrap(DBUnwindFrameTrapVector, 0);
 	    for (; ReadControlCleanupBindings (ps->control); )
               Unbind();
 	  }
 	  if (ReadControlTrapOnExit (ps->control))
-            IllegalOperand;
+            TakeErrorTrap(79, 0);
         }
         /* --- debug
 	if (TypeEqualP (fp[0].TAG, TypeNIL))
@@ -3377,6 +3545,7 @@ Dispatch:
 	sp = fp - 1;
 	fp -= framesize;
 	lp = fp + ReadControlArgumentSize (ps->control = control);
+	CRequestPreemptCheck();
 	for (i = count; i--;)
           *++sp = *valueblock++;
 
@@ -3412,15 +3581,16 @@ Dispatch:
     MARK(BindLocativeToValue);
       if (TypeEqualP(sp->TAG, TypeLocative))
       { 
-	LispObj loc = *sp--;
+	CObject loc = *sp--;
 
 	if (ps->BindingStackPointer >= ps->BindingStackLimit ||
 	    ps->DeepBoundP)
 	  IllegalOperand;
         MemoryRead(loc.DATA.u, scratch, CycleBindRead);
-	loc.TAG |= (ReadControlCleanupBindings(ps->control) << 6);
-	WriteVirtualMemory(ps->BindingStackPointer + 1, &loc);
-        WriteVirtualMemory(ps->BindingStackPointer + 2, scratch);
+	loc.TAG = SetTagCdr(loc.TAG, ReadControlCleanupBindings(ps->control));
+        if (Trace) fprintf(stderr, "Bind BSP=%08x loc=%02x.%08x\n", ps->BindingStackPointer+2, loc.TAG, loc.DATA.u);
+	CWriteVirtualMemory(ps->BindingStackPointer + 1, &loc);
+        CWriteVirtualMemory(ps->BindingStackPointer + 2, scratch);
 	StoreContents(loc.DATA.u, op2, CycleBindWrite);
 	/* no more chance of pclsr-ing */
 	WriteControlCleanupBindings(ps->control, 1);
@@ -3437,15 +3607,16 @@ Dispatch:
     MARK(BindLocative);
       if (TypeEqualP(op2->TAG, TypeLocative))
       {
-	LispObj loc = *op2;
+	CObject loc = *op2;
 
 	if (ps->BindingStackPointer >= ps->BindingStackLimit ||
 	    ps->DeepBoundP)
 	  IllegalOperand;
         MemoryRead(loc.DATA.u, scratch, CycleBindRead);
-	loc.TAG |= (ReadControlCleanupBindings(ps->control) << 6);
-	WriteVirtualMemory(ps->BindingStackPointer + 1, &loc);
-	WriteVirtualMemory(ps->BindingStackPointer + 2, scratch);
+	loc.TAG = SetTagCdr(loc.TAG, ReadControlCleanupBindings(ps->control));
+        if (Trace) fprintf(stderr, "Bind BSP=%08x loc=%02x.%08x\n", ps->BindingStackPointer+2, loc.TAG, loc.DATA.u);
+	CWriteVirtualMemory(ps->BindingStackPointer + 1, &loc);
+	CWriteVirtualMemory(ps->BindingStackPointer + 2, scratch);
 	/* no more chance of pclsr-ing */
 	WriteControlCleanupBindings(ps->control, 1);
 	ps->BindingStackPointer += 2;
@@ -3453,6 +3624,9 @@ Dispatch:
       }
       goto Op2SpareExceptions;  
       
+    case DispatchUnbindNFP: AddressFPOperand(); goto ExecuteUnbindN;
+    case DispatchUnbindNLP: AddressLPOperand(); goto ExecuteUnbindN;
+    case DispatchUnbindNSP: AddressSPOperand(); goto ExecuteUnbindN;
     case DispatchUnbindNImmediate: AddressImmediateOperand (); goto ExecuteUnbindN;
     case DispatchUnbindNPop: AddressPopOperand (); goto ExecuteUnbindN;
       ExecuteUnbindN:
@@ -3506,19 +3680,20 @@ Dispatch:
     case DispatchCatchClose:
       {
         /* cbp[0] == pc, cbp[1] == binding stack, cbp[2] == previous */
-	LispObj *cbp = &ps->StackCache[ps->CatchBlockPointer.DATA.u - ps->StackCacheBase];
-        register Integer control = ps->control;
+	CObject *cbp = &ps->StackCache[ps->CatchBlockPointer.DATA.u - ps->StackCacheBase];
+        register Integer control;
 
 	if (ps->BindingStackPointer != cbp[1].DATA.u)
 	{
 	  if (ps->DeepBoundP)
-	    UnimplementedInstruction;
+            TakeMemoryTrap(DBUnwindCatchTrapVector, 0);
 	  else 
 	    for (; ps->BindingStackPointer > cbp[1].DATA.u; )
 	      if (Unbind())
 		IllegalOperand;
 	}
-	WriteControlExtraArgument(control, ldb(1,7,cbp[2].TAG));
+	control = ps->control;
+        WriteControlExtraArgument(control, ldb(1,7,cbp[2].TAG));
         ps->control = WriteControlCleanupCatch(control, ldb(1,6,cbp[2].TAG));
 	StoreCdrNext(ps->CatchBlockPointer, cbp[2]);
 	if (ldb(1,6,cbp[1].TAG))
@@ -3534,7 +3709,7 @@ Dispatch:
       }
 
     case DispatchPushLexicalVarImmediate:
-      UnimplementedInstruction;
+      UnsupportedInstruction;
     case DispatchPushLexicalVarSP: AddressSPOperand (); goto ExecutePushLexicalVar;
     case DispatchPushLexicalVarFP: AddressFPOperand (); goto ExecutePushLexicalVar;
     case DispatchPushLexicalVarLP: AddressLPOperand (); goto ExecutePushLexicalVar;
@@ -3552,7 +3727,7 @@ Dispatch:
       IllegalOperand;
       
     case DispatchPopLexicalVarImmediate:
-      UnimplementedInstruction;
+      UnsupportedInstruction;
     case DispatchPopLexicalVarSP: AddressSPOperand (); goto ExecutePopLexicalVar;
     case DispatchPopLexicalVarFP: AddressFPOperand (); goto ExecutePopLexicalVar;
     case DispatchPopLexicalVarLP: AddressLPOperand (); goto ExecutePopLexicalVar;
@@ -3570,7 +3745,7 @@ Dispatch:
       IllegalOperand;
       
     case DispatchMovemLexicalVarImmediate:
-      UnimplementedInstruction;
+      UnsupportedInstruction;
     case DispatchMovemLexicalVarSP: AddressSPOperand (); goto ExecuteMovemLexicalVar;
     case DispatchMovemLexicalVarFP: AddressFPOperand (); goto ExecuteMovemLexicalVar;
     case DispatchMovemLexicalVarLP: AddressLPOperand (); goto ExecuteMovemLexicalVar;
@@ -3653,13 +3828,13 @@ Dispatch:
     case DispatchInstanceSetPop: AddressPopOperand (); goto ExecuteInstanceSet;
       ExecuteInstanceSet:
     MARK(InstanceSet);
-      i = LocateArbitraryInstanceVariable(&sp[-1], op2);
-      StoreContents(i, &sp[0], CycleDataWrite);
+      i = LocateArbitraryInstanceVariable(sp, op2);
+      StoreContents(i, &sp[-1], CycleDataWrite);
       sp -= 2;
       NextInstruction;
 
       
-    case DispatchInstanceLocImmediate: AddressImmediateOperand (); goto ExecuteInstanceSet;
+    case DispatchInstanceLocImmediate: AddressImmediateOperand (); goto ExecuteInstanceLoc;
     case DispatchInstanceLocSP: AddressSPOperand (); goto ExecuteInstanceLoc;
     case DispatchInstanceLocFP: AddressFPOperand (); goto ExecuteInstanceLoc;
     case DispatchInstanceLocLP: AddressLPOperand (); goto ExecuteInstanceLoc;
@@ -3671,15 +3846,15 @@ Dispatch:
       NextInstruction;
 
       
-    case DispatchEphemeralpImmediate:
-      UnimplementedInstruction;
+    case DispatchEphemeralpImmediate: AddressImmediateOperand(); goto ExecuteEphemeralp;
     case DispatchEphemeralpSP: AddressSPOperand (); goto ExecuteEphemeralp;
     case DispatchEphemeralpFP: AddressFPOperand (); goto ExecuteEphemeralp;
     case DispatchEphemeralpLP: AddressLPOperand (); goto ExecuteEphemeralp;
     case DispatchEphemeralpPop: AddressPopOperand (); goto ExecuteEphemeralp;
       ExecuteEphemeralp:
     MARK(Ephemeralp);
-      UnimplementedInstruction;
+      PushPredicate(EphemeralP(op2));
+      NextInstruction;
       
     case DispatchUnsignedLesspImmediate:
       SetPredicate (sp->DATA.u < (unsigned int)cp->operand);
@@ -3705,6 +3880,35 @@ Dispatch:
       PushPredicate (sp->DATA.u < op2->DATA.u);
       NextInstruction;
       
+    case DispatchDoubleFloatOpFP: AddressFPOperand(); goto ExecuteDoubleFloatOp;
+    case DispatchDoubleFloatOpLP: AddressLPOperand(); goto ExecuteDoubleFloatOp;
+    case DispatchDoubleFloatOpSP: AddressSPOperand(); goto ExecuteDoubleFloatOp;
+    case DispatchDoubleFloatOpImmediate: AddressImmediateOperand(); goto ExecuteDoubleFloatOp;
+    case DispatchDoubleFloatOpPop: AddressPopOperand(); goto ExecuteDoubleFloatOp;
+    ExecuteDoubleFloatOp:
+    {
+      if (!TypeFixnumP(op2->TAG) || op2->DATA.u > 3) IllegalOperand;
+      uint64_t xbits = ((uint64_t)sp[-3].DATA.u << 32) | sp[-2].DATA.u;
+      uint64_t ybits = ((uint64_t)sp[-1].DATA.u << 32) | sp[0].DATA.u;
+      double x, y, result;
+      memcpy(&x, &xbits, sizeof(x)); memcpy(&y, &ybits, sizeof(y));
+      fenv_t env;
+      feholdexcept(&env);
+      switch (op2->DATA.u) {
+        case 0: result = x + y; break;
+        case 1: result = x - y; break;
+        case 2: result = x * y; break;
+        default: result = x / y; break;
+      }
+      int exception = fetestexcept(FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW | FE_UNDERFLOW);
+      fesetenv(&env);
+      memcpy(&xbits, &result, sizeof(result));
+      sp -= 4;
+      PushFixnum(xbits >> 32); PushFixnum((uint32_t)xbits);
+      PushPredicate(exception);
+      NextInstruction;
+    }
+
     case DispatchAluImmediate: AddressImmediateOperand(); goto ExecuteAlu;
     case DispatchAluSP: AddressSPOperand (); goto ExecuteAlu;
     case DispatchAluFP: AddressFPOperand (); goto ExecuteAlu;
@@ -3745,7 +3949,7 @@ Dispatch:
       ps->ListCacheAddress.DATA.u += op2->DATA.u;
       NextInstruction;
       
-    case DispatchAllocateStructureBlockImmediate: AddressImmediateOperand (); goto ExecuteAllocateListBlock;
+    case DispatchAllocateStructureBlockImmediate: AddressImmediateOperand (); goto ExecuteAllocateStructureBlock;
     case DispatchAllocateStructureBlockSP: AddressSPOperand (); goto ExecuteAllocateStructureBlock;
     case DispatchAllocateStructureBlockFP: AddressFPOperand (); goto ExecuteAllocateStructureBlock;
     case DispatchAllocateStructureBlockLP: AddressLPOperand (); goto ExecuteAllocateStructureBlock;
@@ -3815,16 +4019,20 @@ Dispatch:
 	case InternalRegisterStackCacheLowerBound:
           PushConstant(TypeLocative, ps->StackCacheBase);
 	  break;
+        /* BARs are untagged addresses. In particular, the allocation-miss
+           handler writes a fixnum; saving that tag would hide the BAR from
+           GC while the object being initialized moves to copyspace. */
         case InternalRegisterBAR0:
-          InstructionException;
+          PushConstant(TypeLocative, ps->bar[0].address.DATA.u);
+          break;
         case InternalRegisterBAR1:
-	  PushObject(&ps->bar[1].address);
+	  PushConstant(TypeLocative, ps->bar[1].address.DATA.u);
 	  break;
         case InternalRegisterBAR2:
-	  PushObject(&ps->bar[1].address);
+	  PushConstant(TypeLocative, ps->bar[2].address.DATA.u);
 	  break;
         case InternalRegisterBAR3:
-	  PushObject(&ps->bar[1].address);
+	  PushConstant(TypeLocative, ps->bar[3].address.DATA.u);
 	  break;
         case InternalRegisterPHTHash0:
           InstructionException;
@@ -3834,9 +4042,9 @@ Dispatch:
           InstructionException;
         case InternalRegisterPHTHash3:
           InstructionException;
-        case InternalRegisterEPC:		/* the current PC */
+        case InternalRegisterEPC:		/* the current CPC */
           InstructionException;
-        case InternalRegisterDPC:		/* the current PC + 2 */
+        case InternalRegisterDPC:		/* the current CPC + 2 */
           InstructionException;
         case InternalRegisterContinuation:
 	  PushObject(&ps->continuation);
@@ -3848,7 +4056,7 @@ Dispatch:
 	  PushFixnum(ps->control);
 	  break;
 	case InternalRegisterCRArgumentSize:
-	  PushFixnum (3);
+	  PushFixnum(ReadControlArgumentSize(ps->control));
 	  break;
         case InternalRegisterEphemeralOldspaceRegister:
           PushFixnum(ps->EphemeralOldspaceRegister);
@@ -3863,23 +4071,26 @@ Dispatch:
 	  PushFixnum(0);
           break;
         case InternalRegisterPreemptRegister:
-          PushFixnum(ps->PreemptRegister);
+          PushFixnum(ps->PreemptRegister & 3);
           break;
         case InternalRegisterIcacheControl:
-          InstructionException;
+          PushFixnum(0);
+          break;
         case InternalRegisterPrefetcherControl:
-          InstructionException;
+          PushFixnum(0);
+          break;
         case InternalRegisterMapCacheControl:
-          InstructionException;
+          PushFixnum(0);
+          break;
         case InternalRegisterMemoryControl:
-          InstructionException;
+          PushFixnum(0);
+          break;
         case InternalRegisterECCLog:
           InstructionException;
         case InternalRegisterECCLogAddress:
           InstructionException;
         case InternalRegisterStackCacheOverflowLimit:
-          PushConstant(TypeLocative, ps->StackCacheBase + 
-                                      (ps->StackCacheLimit - ps->StackCache));
+          PushConstant(TypeLocative, ps->StackCacheBase + ps->StackCacheOverflowLimit);
           break;
         case InternalRegisterAddressMask:
           InstructionException;
@@ -3896,7 +4107,11 @@ Dispatch:
         case InternalRegisterExtensionRegister:
           InstructionException;
         case InternalRegisterMicrosecondClock:
-	  goto Read_Microsecond_Clock;
+	  DecacheRegisters();
+          *scratch = CCoprocessorRead(CoprocessorRegisterMicrosecondClock);
+          EncacheRegisters();
+          PushObject(scratch);
+          break;
         case InternalRegisterArrayHeaderLength:
           InstructionException;
         case InternalRegisterTOS:
@@ -3921,11 +4136,14 @@ Dispatch:
           PushConstant (TypeLocative, ps->ControlStackExtraLimit);
           break;
         case InternalRegisterPHTBase:
-          InstructionException;
+          /* The VLM uses host paging. The FEP still saves these hardware
+             registers at halt, so report the same zeros as the Alpha engine. */
+          PushConstant(TypeLocative, 0);
+          break;
         case InternalRegisterPHTMask:
-          InstructionException;
         case InternalRegisterCountMapReloads:
-          InstructionException;
+          PushFixnum(0);
+          break;
         case InternalRegisterListCacheArea:
 	  PushObject(&ps->ListCacheArea);
 	  break;
@@ -3951,9 +4169,11 @@ Dispatch:
           PushFixnum (ps->DynamicBindingCacheMask);
 	  break;
         case InternalRegisterChoicePointer:
-          InstructionException;
+          PushFixnum(ps->ChoicePointer);
+          break;
         case InternalRegisterStructureStackChoicePointer:
-          InstructionException;
+          PushFixnum(ps->StructureStackChoicePointer);
+          break;
         case InternalRegisterFEPModeTrapVectorAddress:
           PushConstant (TypeLocative, ps->FEPModeTrapVectorAddress);
 	  break;
@@ -3964,7 +4184,8 @@ Dispatch:
           PushFixnum (ps->MappingTableLength);
 	  break;
         case InternalRegisterStackFrameMaximumSize:
-          InstructionException;
+          PushFixnum(128);
+          break;
         case InternalRegisterStackCacheDumpQuantum:
           PushFixnum (PageSize);
           break;
@@ -3991,7 +4212,8 @@ Dispatch:
         case InternalRegisterStackCacheLowerBound:
           InstructionException;
         case InternalRegisterBAR0:
-          InstructionException;
+          ps->bar[0].address = *sp;
+          break;
         case InternalRegisterBAR1:
 	  ps->bar[1].address = *sp;
 	  break;
@@ -4022,16 +4244,17 @@ Dispatch:
         case InternalRegisterFPCoprocessorPresent:
           break;
         case InternalRegisterPreemptRegister:
-          ps->PreemptRegister = sp[0].DATA.u;
+          ps->PreemptRegister = (ps->PreemptRegister & ~3u) | (sp[0].DATA.u & 3);
+	  CRequestPreemptCheck();
 	  break;
         case InternalRegisterIcacheControl:
-          InstructionException;
+          break;
         case InternalRegisterPrefetcherControl:
-          InstructionException;
+          break;
         case InternalRegisterMapCacheControl:
-          InstructionException;
+          break;
         case InternalRegisterMemoryControl:
-          InstructionException;
+          break;
         case InternalRegisterInvalidateMap0:
           InstructionException;
         case InternalRegisterInvalidateMap1:
@@ -4049,7 +4272,8 @@ Dispatch:
         case InternalRegisterLoadMap3:
           InstructionException;
         case InternalRegisterStackCacheOverflowLimit:
-          InstructionException;
+          ps->StackCacheOverflowLimit = sp->DATA.u - ps->StackCacheBase;
+          break;
         case InternalRegisterAddressMask:
           InstructionException;
         case InternalRegisterInstruction:
@@ -4059,7 +4283,7 @@ Dispatch:
         case InternalRegisterExtensionRegister:
           InstructionException;
         case InternalRegisterMicrosecondClock:
-          goto Write_Microsecond_Clock;
+          break;
         case InternalRegisterLoadBAR0:
           InstructionException;
         case InternalRegisterLoadBAR1:
@@ -4120,9 +4344,11 @@ Dispatch:
           ps->DynamicBindingCacheMask = sp[0].DATA.u;
 	  break;
         case InternalRegisterChoicePointer:
-          InstructionException;
+          ps->ChoicePointer = sp->DATA.u;
+          break;
         case InternalRegisterStructureStackChoicePointer:
-          InstructionException;
+          ps->StructureStackChoicePointer = sp->DATA.u;
+          break;
         case InternalRegisterFEPModeTrapVectorAddress:
           ps->FEPModeTrapVectorAddress = sp[0].DATA.u;
 	  break;
@@ -4143,84 +4369,38 @@ Dispatch:
       NextInstruction;
       
     case DispatchCoprocessorRead:
-      switch ((unsigned int)cp->operand)
-      {
-        case CoprocessorRegisterMicrosecondClock:
-          Read_Microsecond_Clock:
-	  {
-#ifdef USE_WALL_TIME
-	    struct timeval current_time;
-
-	    gettimeofday (&current_time, NULL);
-	    /* High 12 bits are seconds, low 20 bits are microseconds */
-	    PushFixnum (((unsigned int) current_time.tv_sec * 1000000) +
-			(unsigned int) current_time.tv_usec);
-#else
-	    long tps = sysconf(_SC_CLK_TCK);
-            struct tms tms;
-
-            times(&tms);
-            PushFixnum ((unsigned int)((long) (tms.tms_utime  + tms.tms_stime)
-                          * 1000000 / tps));
-#endif
-            break;
-	  }
-	case VMRegisterCommand:
-	  PushFixnum(VM.CommandRegister);
-	  break;
-	case VMRegisterAddress:
-	  PushConstant(TypeLocative, VM.AddressRegister);
-	  break;
-	case VMRegisterExtent:
-	  PushFixnum(VM.ExtentRegister);
-	  break;
-	case VMRegisterAttributes:
-	  PushFixnum(VM.AttributesRegister);
-	  break;
-	case VMRegisterDestination:
-	  PushConstant(TypeLocative, VM.DestinationRegister);
-	  break;
-	case VMRegisterData:
-	  PushObject(&VM.DataRegister);
-	  break;
-        default:
-	  InstructionException;
-      }
+      DecacheRegisters();
+      *scratch = CCoprocessorRead(cp->operand);
+      EncacheRegisters();
+      if (scratch->whole == UINT64_MAX) InstructionException;
+      PushObject(scratch);
       NextInstruction;
-      
+
     case DispatchCoprocessorWrite:
-      switch ((unsigned int)cp->operand)
-      {
-        case 01010:		/* --- Compatible w/ MacIvory */
-          SendInterruptToLifeSupport();
-          break;
-        case CoprocessorRegisterMicrosecondClock:
-          Write_Microsecond_Clock:
-	  /* --- This is a no-op.  Too bad. */
-	  break;
-	case VMRegisterCommand:
-	  VM.CommandRegister = VMCommand(sp->DATA.u);
-	  break;
-	case VMRegisterAddress:
-	  VM.AddressRegister = sp->DATA.u;
-	  break;
-	case VMRegisterExtent:
-	  VM.ExtentRegister = sp->DATA.u;
-	  break;
-	case VMRegisterAttributes:
-	  VM.AttributesRegister = sp->DATA.u;
-	  break;
-	case VMRegisterDestination:
-	  VM.DestinationRegister = sp->DATA.u;
-	  break;
-	case VMRegisterData:
-	  VM.DataRegister = *sp;
-	  break;
-        default:
-	  InstructionException;
+    {
+      CObject nextpc = cp->next_pc;
+      CObject value = *sp--;
+      if (cp->operand == 646) {
+        if (!(TypeEqualP(sp->TAG, TypeEvenPC) || TypeEqualP(sp->TAG, TypeOddPC)) ||
+            !TypeEqualP(sp[-1].TAG, TypeLocative) ||
+            !TypeEqualP(sp[-2].TAG, TypeLocative) || !TypeFixnumP(sp[-3].TAG))
+          IllegalOperand;
+        ps->continuation = *sp--;
+        fp = ps->StackCache + (uint32_t)(sp->DATA.u - ps->StackCacheBase); --sp;
+        lp = ps->StackCache + (uint32_t)(sp->DATA.u - ps->StackCacheBase); --sp;
+        fp[0].TAG |= 0300;
+        fp[1].TAG |= 0300;
+        fp[1].DATA.u = (fp[1].DATA.u & ~(1u << 24)) | (ps->control & (1u << 24));
+        ps->control = (sp--)->DATA.u;
+      } else {
+        DecacheRegisters();
+        i = CCoprocessorWrite(cp->operand, value);
+        EncacheRegisters();
+        if (!i) IllegalOperand;
       }
-      sp--;
-      NextInstruction;
+      pc = nextpc;
+      goto InstructionCacheLookup;
+    }
 
     case DispatchMemoryRead:
       { 
@@ -4295,7 +4475,7 @@ Dispatch:
 
 	if (ObjectEqP(sp[0], *scratch))
 	  {
-	    WriteVirtualMemory(vma, op2);
+	    CWriteVirtualMemory(vma, op2);
 	    sp--;
 	    SetT();
 	  }
@@ -4319,7 +4499,7 @@ Dispatch:
     MARK(MemoryWrite);
       if (!TypeEqualP(sp[0].TAG, TypePhysicalAddress))
       {
-	WriteVirtualMemory(sp[0].DATA.u, op2);
+	CWriteVirtualMemory(sp[0].DATA.u, op2);
 	sp--;
 	NextInstruction;
       }
@@ -4365,11 +4545,40 @@ Dispatch:
       NextInstruction;  
       
     case DispatchGenericDispatch:
-      UnimplementedInstruction;
-      
     case DispatchMessageDispatch:
-      UnimplementedInstruction;
-      
+    {
+      if (ReadControlArgumentSize(ps->control) < 4) {
+        i = 4 - ReadControlArgumentSize(ps->control);
+        if (ReadControlApply(ps->control)) goto PullApplyArgsTrap;
+        IllegalOperand;
+      }
+      int message = cp->code == DispatchMessageDispatch;
+      CObject generic = fp[message ? 3 : 2];
+      CObject instance = fp[message ? 2 : 3];
+      CObject descriptor, mask, table, key, method, parameter;
+      if (TagType(instance.TAG) >= TypeInstance && TagType(instance.TAG) <= TypeStringInstance)
+        MemoryReadHeader(instance.DATA.u, &descriptor);
+      else MemoryReadData(TrapVectorBase + GenericDispatchVector + TagType(instance.TAG), &descriptor);
+      uint32_t vma = MemoryReadData(descriptor.DATA.u, &mask);
+      MemoryReadData(vma + 1, &table);
+      if (!TypeFixnumP(mask.TAG) || !TypeEqualP(table.TAG, TypeLocative)) IllegalOperand;
+      vma = table.DATA.u + (generic.DATA.u & mask.DATA.u) * 3;
+      for (;;) {
+        vma = MemoryReadData(vma, &key);
+        if (TypeEqualP(key.TAG, TypeNIL) || ObjectEqP(key, generic)) break;
+        vma += 3;
+        AllowSequenceBreaks;
+      }
+      vma = MemoryReadData(vma + 1, &method);
+      MemoryReadData(vma + 1, &parameter);
+      if (!TypeEqualP(method.TAG, TypeEvenPC) && !TypeEqualP(method.TAG, TypeOddPC)) IllegalOperand;
+      if (!TypeEqualP(parameter.TAG, TypeNIL)) StoreCdrNext(fp[2], parameter);
+      else if (message) StoreCdrNext(fp[2], generic);
+      if (message) StoreCdrNext(fp[3], instance);
+      pc = method;
+      goto InstructionCacheLookup;
+    }
+
     case DispatchJumpSP: AddressSPOperand (); goto ExecuteJump;
     case DispatchJumpFP: AddressFPOperand (); goto ExecuteJump;
     case DispatchJumpLP: AddressLPOperand (); goto ExecuteJump;
@@ -4382,18 +4591,22 @@ Dispatch:
           case TypeOddPC:
             pc = *op2;
             if (ldb(1,7,op2->TAG))
-	      WriteControlCleanupInProgress(processor->control, ldb(1,6,op2->TAG));
+	      WriteControlCleanupInProgress(c_processor->control, ldb(1,6,op2->TAG));
             goto InstructionCacheLookup;
 	}
       InstructionException;
 
     case DispatchCheckPreemptRequest:
-      UnimplementedInstruction;
+      if (ps->PreemptRegister & 2) ps->PreemptRegister |= 1;
+      CRequestPreemptCheck();
+      NextInstruction;
       
     case DispatchNoOp:
       NextInstruction;
       
     case DispatchHalt:
+      if (ReadControlTrapMode(ps->control) != TrapModeFEP) InstructionException;
+      ps->halt_reason = 2;
       goto save_and_halt;
       
     case DispatchPushExternalValueCellPointer:
@@ -4441,7 +4654,15 @@ Dispatch:
     case DispatchDereferencePop: AddressPopOperand (); goto ExecuteDereference;
     ExecuteDereference:
     MARK(Dereference);
-      UnimplementedInstruction;
+      switch (TagType(op2->TAG)) {
+      case TypeOneQForward: case TypeElementForward: case TypeHeaderForward:
+      case TypeExternalValueCellPointer:
+        MemoryReadData(op2->DATA.u, scratch); PushObject(scratch); break;
+      case TypeLogicVariable:
+        PushConstant(TypeExternalValueCellPointer, op2->DATA.u); break;
+      default: PushObject(op2); break;
+      }
+      NextInstruction;
       
     case DispatchUnifySP: AddressSPOperand (); goto ExecuteUnify;
     case DispatchUnifyFP: AddressFPOperand (); goto ExecuteUnify;
@@ -4449,32 +4670,46 @@ Dispatch:
     case DispatchUnifyPop: AddressPopOperand (); goto ExecuteUnify;
     ExecuteUnify:
     MARK(Unify);
-      UnimplementedInstruction;
+      UnsupportedInstruction;
       
-    case DispatchPushLocalLogicVariablesImmediate:
-      UnimplementedInstruction;
+    case DispatchPushLocalLogicVariablesImmediate: AddressImmediateOperand(); goto ExecutePushLocalLogicVariables;
     case DispatchPushLocalLogicVariablesSP: AddressSPOperand (); goto ExecutePushLocalLogicVariables;
     case DispatchPushLocalLogicVariablesFP: AddressFPOperand (); goto ExecutePushLocalLogicVariables;
     case DispatchPushLocalLogicVariablesLP: AddressLPOperand (); goto ExecutePushLocalLogicVariables;
     case DispatchPushLocalLogicVariablesPop: AddressPopOperand (); goto ExecutePushLocalLogicVariables;
     ExecutePushLocalLogicVariables:
     MARK(PushLocalLogicVariables);
-      UnimplementedInstruction;
+      if (!TypeFixnumP(op2->TAG) || op2->DATA.s < 0) IllegalOperand;
+      i = op2->DATA.s;
+      while (i--) {
+        if (sp >= ps->StackCacheLimit) {
+          DecacheRegisters(); StackCacheScrollUp(); EncacheRegisters();
+        }
+        PushConstant(TypeLogicVariable, ps->StackCacheBase + (sp + 1 - ps->StackCache));
+      }
+      NextInstruction;
       
     case DispatchPushGlobalLogicVariable:
-      UnimplementedInstruction;
+      *scratch = (CObject)COBJECT(TypeExternalValueCellPointer, ps->bar[2].address.DATA.u);
+      StoreContents(scratch->DATA.u, scratch, CycleDataWrite);
+      PushObject(scratch); ps->bar[2].address.DATA.u++;
+      NextInstruction;
       
-    case DispatchLogicTailTestImmediate:
-      UnimplementedInstruction;
+    case DispatchLogicTailTestImmediate: AddressImmediateOperand(); goto ExecuteLogicTailTest;
     case DispatchLogicTailTestSP: AddressSPOperand (); goto ExecuteLogicTailTest;
     case DispatchLogicTailTestFP: AddressFPOperand (); goto ExecuteLogicTailTest;
     case DispatchLogicTailTestLP: AddressLPOperand (); goto ExecuteLogicTailTest;
     case DispatchLogicTailTestPop: AddressPopOperand (); goto ExecuteLogicTailTest;
     ExecuteLogicTailTest:
     MARK(LogicTailTest);
-      UnimplementedInstruction;
+      switch (TagType(op2->TAG)) {
+      case TypeList: case TypeListInstance: PushNIL(); break;
+      case TypeExternalValueCellPointer: PushT(); break;
+      default: InstructionException;
+      }
+      NextInstruction;
       
-   default: UnimplementedInstruction;
+   default: UnsupportedInstruction;
   }
 
     Op2FixnumExceptions:
@@ -4541,19 +4776,20 @@ Dispatch:
     HandleUnwindProtect:
     {
       /* cbp[0] == pc, cbp[1] == binding stack, cbp[2] == previous */
-      LispObj *cbp = &ps->StackCache[ps->CatchBlockPointer.DATA.u - ps->StackCacheBase];
-      register Integer control = ps->control;
+      CObject *cbp = &ps->StackCache[ps->CatchBlockPointer.DATA.u - ps->StackCacheBase];
+      register Integer control;
       sp = restartsp;
 
       if (ps->BindingStackPointer != cbp[1].DATA.u)
 	{
 	  if (ps->DeepBoundP)
-	    UnimplementedInstruction;
+            TakeMemoryTrap(DBUnwindCatchTrapVector, 0);
 	  else 
 	    for (; ps->BindingStackPointer > cbp[1].DATA.u; )
 	      if (Unbind())
 		IllegalOperand;
 	}
+      control = ps->control;
       PushConstant(SetTagCdr(pc.TAG, dpb(ReadControlCleanupInProgress(control), 1, 0, 2)),
 	           pc.DATA.u);
       WriteControlCleanupInProgress(control, 1);
@@ -4566,8 +4802,8 @@ Dispatch:
 
     PullApplyArgsTrap:
     {
-      LispObj pull = { TypeFixnum, 0 };
-      LispObj apply = *sp--;
+      CObject pull = COBJECT(TypeFixnum, 0 );
+      CObject apply = *sp--;
     
       restartsp = sp;
       pull.DATA.s = i;
@@ -4578,17 +4814,18 @@ Dispatch:
       goto InstructionCacheLookup;
     }
 
-    UnimplementedInstructionTag:
+    UnsupportedInstructionTag:
     if (Trace)
-      fprintf(stderr, "Unimplemented instruction at PC %08x, #%d\n", pc.DATA.u, ps->instruction_count);
+      fprintf(stderr, "Unimplemented instruction at PC %08x, #%lu\n", pc.DATA.u, ps->instruction_count);
     {
-      LispObj microstate;
+      CObject microstate;
 
       microstate.TAG = TypeFixnum;
       /* --- pass a microstate somehow */
       microstate.DATA.s = 0;
       DecacheRegisters();
-      if (!TakePreTrap(ErrorTrapVector, &microstate, &pc))
+      CObject faultpc = pc;
+      if (!TakePreTrap(ErrorTrapVector, &microstate, &faultpc))
         goto halt;
       EncacheRegisters();
       goto InstructionCacheLookup;
@@ -4596,16 +4833,16 @@ Dispatch:
 
     IllegalOperandTag:
     if (Trace)
-      fprintf(stderr, "Illegal operand at PC %08x, #%d\n", pc.DATA.u, ps->instruction_count);
+      fprintf(stderr, "Illegal operand at PC %08x, #%lu\n", pc.DATA.u, ps->instruction_count);
     {
-      LispObj microstate, vma;
+      CObject microstate, vma;
 
       microstate.TAG = TypeFixnum;
       /* --- pass a microstate somehow */
       microstate.DATA.s = 0;
       vma.TAG = TypeLocative; 
       /* --- not always op2, but maybe the non-op2 cases vma is not valid anyways? */
-      vma.DATA.u = ps->StackCacheBase + (op2 - ps->StackCache);
+      vma.DATA.u = ps->StackCacheBase + (sp - ps->StackCache);
       DecacheRegisters();
       if (!TakePreTrap(ErrorTrapVector, &microstate, &vma))
         goto halt;
@@ -4615,7 +4852,7 @@ Dispatch:
 
     InstructionExceptionTag:
     if (Trace)
-      fprintf(stderr, "Instruction exception at PC %08x, #%d\n", pc.DATA.u, ps->instruction_count);
+      fprintf(stderr, "Instruction exception at PC %08x, #%lu\n", pc.DATA.u, ps->instruction_count);
     {
       DecacheRegisters();
       if(!TakeInstructionException(cp->instruction, op2, &cp->next_pc))
@@ -4628,7 +4865,5 @@ Dispatch:
       DecacheRegisters();
     halt:
       ps->running = 0;
-      signal(SIGIO, old_io_handler);
-      signal(SIGSEGV, old_segv_handler);
-      return;
+      return ps->halt_reason;
 }

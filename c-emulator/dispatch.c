@@ -107,7 +107,7 @@ static const int PopInstructionDecoder[256] =
   DispatchDereferencePop,
   DispatchLogicTailTestPop,
   DispatchProcBreakpointPop,
-  DispatchIllegalInstruction,
+  DispatchDoubleFloatOpPop,
   DispatchIllegalInstruction,
   DispatchPushLexicalVarPop,
   DispatchPushLexicalVarPop,
@@ -359,7 +359,8 @@ static void DecodeNoneFunction (int i, InstructionCacheLine *cp)
 }
 
 static InstructionCacheLine InstructionCacheLookupCPRepresentation =
-  { TypeOddPC, -1, TypeOddPC, -1, DispatchInstructionCacheLookup, 0, 0, NULL };
+  { .pc = COBJECT(TypeOddPC, -1), .next_pc = COBJECT(TypeOddPC, -1),
+    .code = DispatchInstructionCacheLookup };
 
 static void Decode8BitUnsignedOperandFunction (int i, InstructionCacheLine *cp)
 {
@@ -491,10 +492,10 @@ static const DecoderPair PackedInstructionDecoder[1024] =
   { DispatchProcBreakpointLP, DecodeLPOperandFunction },
   { DispatchProcBreakpointSP, DecodeSPOperandFunction },
   { DispatchProcBreakpointImmediate, Decode8BitSignedOperandFunction },
-  { DispatchIllegalInstruction, DecodeNoneFunction },
-  { DispatchIllegalInstruction, DecodeNoneFunction },
-  { DispatchIllegalInstruction, DecodeNoneFunction },
-  { DispatchIllegalInstruction, DecodeNoneFunction },
+  { DispatchDoubleFloatOpFP, DecodeFPOperandFunction },
+  { DispatchDoubleFloatOpLP, DecodeLPOperandFunction },
+  { DispatchDoubleFloatOpSP, DecodeSPOperandFunction },
+  { DispatchDoubleFloatOpImmediate, Decode8BitUnsignedOperandFunction },
   { DispatchIllegalInstruction, DecodeNoneFunction },
   { DispatchIllegalInstruction, DecodeNoneFunction },
   { DispatchIllegalInstruction, DecodeNoneFunction },
@@ -719,9 +720,9 @@ static const DecoderPair PackedInstructionDecoder[1024] =
   { DispatchTakeValues, Decode8BitUnsignedOperandFunction },
   { DispatchTakeValues, Decode8BitUnsignedOperandFunction },
   { DispatchTakeValues, Decode8BitUnsignedOperandFunction },
-  { DispatchIllegalInstruction, Decode8BitUnsignedOperandFunction },
-  { DispatchIllegalInstruction, Decode8BitUnsignedOperandFunction },
-  { DispatchIllegalInstruction, Decode8BitUnsignedOperandFunction },
+  { DispatchUnbindNFP, DecodeFPOperandFunction },
+  { DispatchUnbindNLP, DecodeLPOperandFunction },
+  { DispatchUnbindNSP, DecodeSPOperandFunction },
   { DispatchUnbindNImmediate, Decode8BitUnsignedOperandFunction },
   { DispatchPushInstanceVariable, Decode8BitUnsignedOperandFunction },
   { DispatchPushInstanceVariable, Decode8BitUnsignedOperandFunction },
@@ -1462,6 +1463,12 @@ static const DecoderPair PackedInstructionDecoder[1024] =
 };
 
 const char *ivory_dispatch_names[] = {
+  "DoubleFloatOpFP",
+  "DoubleFloatOpLP",
+  "DoubleFloatOpSP",
+  "DoubleFloatOpImmediate",
+  "DoubleFloatOpPop",
+
   "CarFP",
   "CarLP",
   "CarSP",
@@ -1625,6 +1632,9 @@ const char *ivory_dispatch_names[] = {
   "ReturnKludgeImmediate",
   "ReturnKludgePop",
   "TakeValues",
+  "UnbindNFP",
+  "UnbindNLP",
+  "UnbindNSP",
   "UnbindNImmediate",
   "UnbindNPop",
   "PushInstanceVariable",
@@ -2192,21 +2202,20 @@ int InstructionCacheMiss (void)
 {
   Integer block_vma;
   InstructionCacheLine *block_cp;
-  LispObj *block_instruction;
   
-  block_vma = (processor->pc.DATA.u & ~((InstructionCacheLineSize >> 1) - 1));
-  block_cp = processor->InstructionCache + ((block_vma << 1) & (InstructionCacheSize - 1));
+  block_vma = (c_processor->pc.DATA.u & ~((InstructionCacheLineSize >> 1) - 1));
+  block_cp = c_processor->InstructionCache + ((block_vma << 1) & (InstructionCacheSize - 1));
   
   {
     Integer bound_vma = block_vma + (InstructionCacheLineSize>>1);
     Integer vma;
     InstructionCacheLine *even_cp, *odd_cp;
-    LispObj instruction_block[(InstructionCacheLineSize>>1)];
-    LispObj *instruction = &instruction_block[0];
+    CObject instruction_block[(InstructionCacheLineSize>>1)];
+    CObject *instruction = &instruction_block[0];
     Tag tag;
     Integer data;
     
-    VirtualMemoryReadBlock(block_vma, instruction_block, (InstructionCacheLineSize>>1));
+    CRawReadBlock(block_vma, instruction_block, (InstructionCacheLineSize>>1));
     
     for (vma = block_vma, even_cp = block_cp, odd_cp = block_cp + 1;
     vma < bound_vma;

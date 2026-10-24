@@ -6,57 +6,43 @@
 #define _EMULATOR_H
 
 #include <limits.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
 
 typedef unsigned char Byte;
 typedef unsigned char Tag;
-typedef unsigned int Integer;
+typedef uint32_t Integer;
 typedef int Boolean;
 typedef float Float;
 typedef void *Pointer;
-
 #define False 0
 #define True 1
 
-#define ldb(ss,pp,source) ((int) (((source) >> (pp)) & ((1 << (ss)) - 1)))
-#define dpb(field,ss,pp,background) ((((field) & ((1 << (ss)) - 1)) << (pp)) | ((background) & (~(((1 << (ss)) - 1) << (pp)))))
+static inline uint32_t CMask(unsigned width)
+{ return width >= 32 ? UINT32_MAX : (UINT32_C(1) << width) - 1; }
+#define ldb(ss,pp,source) ((uint32_t)(source) >> (pp) & CMask(ss))
+#define dpb(field,ss,pp,background) (((uint32_t)(background) & ~(CMask(ss) << (pp))) | (((uint32_t)(field) & CMask(ss)) << (pp)))
 #define ceiling(n,d) (((n) + ((d) - 1)) / (d))
-#if (WORD_BIT == 32)
-#define SignExtend8(i) (((int)((unsigned int)i << 24)) / 16777216)
-#define SignExtend10(i) (((int)((unsigned int)i << 22)) / 4194304)
-#else
-#define SignExtend8(i) (((int)((unsigned int)i << (WORD_BIT-8))) / (1<<(WORD_BIT-8)))
-#define SignExtend10(i) (((int)((unsigned int)i << (WORD_BIT-10))) / (1<<(WORD_BIT-10)))
-#endif
+#define SignExtend8(i) ((int32_t)((uint32_t)(i) << 24) >> 24)
+#define SignExtend10(i) ((int32_t)((uint32_t)(i) << 22) >> 22)
 
-typedef union
-{
-  struct _LispObj
-  {
-#if (LONG_BIT == 64)
-    unsigned int tag;
-#else
-    unsigned char tag;
-#endif
-    union {
-	    unsigned int u;
-	    signed int s;
-	    float f;
-	  } data;
+/* Same data/tag layout as the host LispObj, with typed data accessors. */
+typedef union {
+  struct {
+    union { uint32_t u; int32_t s; float f; } data;
+    uint32_t tag;
   } parts;
-#if (LONG_BIT == 64)
-  unsigned long whole;
-#endif  
-} LispObj, PC;
+  uint64_t whole;
+} CObject, CPC;
 #define DATA parts.data
 #define TAG parts.tag
-
-#define LispObjTag(lo) (((LispObj*)(&lo))->TAG)
-#define LispObjData(lo) (((LispObj*)(&lo))->DATA.u)
+#define COBJECT(tag_, data_) { .parts = { .data = { .u = (uint32_t)(data_) }, .tag = (tag_) } }
 
 typedef struct _InstructionCacheLine
 {
-  PC pc;
-  PC next_pc;
+  CPC pc;
+  CPC next_pc;
   int code;
   int operand;
   unsigned int instruction;
@@ -85,24 +71,24 @@ typedef struct _InstructionCacheLine
 
 typedef struct _ProcessorState
 {
-  LispObj *sp;
-  LispObj *restartsp;
-  LispObj *fp;
-  LispObj *lp;
-  PC pc;
-  PC continuation;
+  CObject *sp;
+  CObject *restartsp;
+  CObject *fp;
+  CObject *lp;
+  CPC pc;
+  CPC continuation;
   InstructionCacheLine *InstructionCache;
-  LispObj *StackCache;
-  LispObj *StackCacheLimit;
+  CObject *StackCache;
+  CObject *StackCacheLimit;
   struct _bar {
-	        LispObj address;
-		LispObj *mapped;
+	        CObject address;
+		CObject *mapped;
 	      } bar[4];
-  LispObj ListCacheArea;
-  LispObj ListCacheAddress;
-  LispObj StructureCacheArea;
-  LispObj StructureCacheAddress;
-  LispObj CatchBlockPointer;
+  CObject ListCacheArea;
+  CObject ListCacheAddress;
+  CObject StructureCacheArea;
+  CObject StructureCacheAddress;
+  CObject CatchBlockPointer;
 /* Integer fields are at the end for better alignment */
   Integer control;
   Integer StackCacheBase;
@@ -114,7 +100,7 @@ typedef struct _ProcessorState
   Boolean DeepBoundP;
   Integer PreemptRegister;
   Integer AluAndRotateControl;
-  Integer (*AluOp)();
+  Integer (*AluOp)(Integer, Integer, Integer);
   Integer ByteSize;
   Integer ByteRotate;
   Integer RotateLatch;
@@ -128,36 +114,43 @@ typedef struct _ProcessorState
   Integer DynamicBindingCacheBase;
   Integer DynamicBindingCacheMask;
   Integer FEPModeTrapVectorAddress;
+  Integer ChoicePointer;
+  Integer StructureStackChoicePointer;
+  Integer StackCacheOverflowLimit;
   Integer MappingTableCache;
   Integer MappingTableLength;
   Boolean running;
-  unsigned int instruction_count;
-} ProcessorState;
+  uint64_t instruction_count;
+  unsigned StackCacheWords;
+  int halt_reason;
+} CProcessorState;
 
-extern ProcessorState *processor;
+extern CProcessorState *c_processor;
 extern Boolean Trace;
 
-extern void InitializeIvoryProcessor (Integer *dataBase, Tag *tagsBase);
-extern Boolean IvoryProcessorSystemStartup (Boolean bootingP);
-extern Boolean Runningp (void);
-extern void PushOneFakeFrame (void);
-extern void PopOneFakeFrame (void);
-extern void HaltMachine (void);
-extern void StartMachine (void);
-extern void ResetMachine (void);
-Boolean ReadInternalRegister (int regno, LispObj* val);
-Boolean WriteInternalRegister (int regno, LispObj* val);
-extern void SendInterruptToEmulator (void);
-extern void SendInterruptToLifeSupport (void);
-
-extern void InstructionSequencer (void);
-extern void OutOfMemory(char *Where, int HowMuch);
-extern void StackCacheScrollDown (void);
-extern void StackCacheScrollUp (void);
-extern int WriteVirtualMemoryBlock (Integer vma, LispObj *object, int count);
-extern int ReadVirtualMemoryBlock (Integer vma, LispObj *object, int count);
-extern int WriteVirtualMemory (Integer vma, LispObj *object);
-extern int ReadVirtualMemory (Integer vma, LispObj *object);
+int CInstructionSequencer(void);
+void CFlushInstructionCache(void);
+void CImportState(void);
+void CExportState(void);
+int CPollInterrupt(void);
+void CRequestPreemptCheck(void);
+CObject CCoprocessorRead(unsigned reg);
+int CCoprocessorWrite(unsigned reg, CObject value);
+void StackCacheScrollDown(void);
+void StackCacheScrollUp(void);
+void EnsureStackCacheSpace(unsigned words);
+int CheckControlStack(int post_trap);
+int TakePostTrap(int index, int arity, CObject *nextpc);
+int CWriteVirtualMemoryBlock(Integer vma, CObject *object, int count);
+int CReadVirtualMemoryBlock(Integer vma, CObject *object, int count);
+int CWriteVirtualMemory(Integer vma, CObject *object);
+int CReadVirtualMemory(Integer vma, CObject *object);
+void TakeMemoryTrap(int vector, Integer vma);
+void TakeIllegalOperandTrap(int microstate, CObject *operand);
+void TakeInstructionExceptionTrap(void);
+int TakePreTrap(Integer index, CObject *extra1, CObject *extra2);
+int TakeInstructionException(int instruction, CObject *op2, CObject *nextpc);
+extern Integer (*ALUFunctionClass[4])(Integer, Integer, Integer);
 
 typedef enum _MemoryCycleTypes
 {
@@ -183,14 +176,14 @@ typedef enum _MemoryCycleTypes
 #define MemoryActionTransform 020
 #define MemoryActionBinding 040
 
-extern Byte MemoryActionTable[12][64];
-extern Integer MemoryReadInternal (Integer vma, LispObj *object, Byte row[]);
-extern int StoreContentsInternal (Integer vma, LispObj *object, Byte row[]);
+extern Byte CMemoryActionTable[13][64];
+extern Integer MemoryReadInternal (Integer vma, CObject *object, Byte row[]);
+extern int StoreContentsInternal (Integer vma, CObject *object, Byte row[]);
 
-#define MemoryRead(vma, object, cycle) MemoryReadInternal(vma, object, MemoryActionTable[cycle])
-#define MemoryReadData(vma, object) MemoryReadInternal(vma, object, MemoryActionTable[CycleDataRead])
-#define MemoryReadHeader(vma, object) MemoryReadInternal(vma, object, MemoryActionTable[CycleHeader])
-#define MemoryReadCdr(vma, object) MemoryReadInternal(vma, object, MemoryActionTable[CycleCdr])
-#define StoreContents(vma, object, cycle) StoreContentsInternal(vma, object, MemoryActionTable[cycle])
+#define MemoryRead(vma, object, cycle) MemoryReadInternal(vma, object, CMemoryActionTable[cycle])
+#define MemoryReadData(vma, object) MemoryReadInternal(vma, object, CMemoryActionTable[CycleDataRead])
+#define MemoryReadHeader(vma, object) MemoryReadInternal(vma, object, CMemoryActionTable[CycleHeader])
+#define MemoryReadCdr(vma, object) MemoryReadInternal(vma, object, CMemoryActionTable[CycleCdr])
+#define StoreContents(vma, object, cycle) StoreContentsInternal(vma, object, CMemoryActionTable[cycle])
 
 #endif

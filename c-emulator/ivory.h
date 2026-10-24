@@ -54,8 +54,8 @@ typedef enum _IvoryType
   TypeCharacter,		/* 43 Common Lisp character object */
   TypeLogicVariable,		/* 44 Unbound logic variable marker */
   TypeGCForward,		/* 45 ObjectMoved flag for garbage collector */
-  TypeEvenPC,			/* 46 PC at first instruction in word */
-  TypeOddPC,			/* 47 PC at second instruction in word */
+  TypeEvenPC,			/* 46 CPC at first instruction in word */
+  TypeOddPC,			/* 47 CPC at second instruction in word */
   /* FullWord instructions. */
   TypeCallCompiledEven,		/* 50 Start call, address is compiled function */
   TypeCallCompiledOdd,		/* 51 Start call, address is compiled function */
@@ -85,7 +85,7 @@ typedef enum _IvoryCdr
 #define TagCdrMask 0300
 #define TagType(tag) ((tag) & 077)
 #define TagCdr(tag) ((tag) >> 6)
-#define SetTagCdr(tag,cdr) ((tag) | (cdr) << 6)
+#define SetTagCdr(tag,cdr) (((tag) & TagTypeMask) | ((cdr) << 6))
 #define MergeCdr(cdr,type) (((cdr)&TagCdrMask)|((type)&TagTypeMask))
 #define TypeEqualP(tag1,tag2) ((((tag1) ^ (tag2)) & TagTypeMask) == 0)
 #define TypeFixnumP(tag) TypeEqualP(tag,TypeFixnum)
@@ -96,17 +96,11 @@ typedef enum _IvoryCdr
 #define BinaryTypeFixnumP(tag1,tag2) (((((tag1) ^ TypeFixnum) | ((tag2) ^ TypeFixnum)) & TagTypeMask) == 0)
 #define BinaryTypeNumericP(tag1,tag2) (((tag1) & 070) == 010 && ((tag2) & 070) == 010)
 
-#if (LONG_BIT == 64)
-extern const LispObj ObjectCdrMask;
-#define StoreCdrNext(dest,source) ((dest).whole = (source).whole&(~ObjectCdrMask.whole))
-#define ObjectEqP(a,b) ((((a).whole^(b).whole)&(~ObjectCdrMask.whole))==0)
-#else
-#define StoreCdrNext(dest,source) { (dest).TAG = (source).TAG&TagTypeMask; (dest).DATA = (source).DATA; }
-#define ObjectEqP(a,b) (((a).DATA == (b).DATA) && TypeEqualP((a).TAG,(b).TAG))
-#endif
+#define StoreCdrNext(dest,source) ((dest).whole = (source).whole & ~UINT64_C(0xc000000000))
+#define ObjectEqP(a,b) ((((a).whole ^ (b).whole) & ~UINT64_C(0xc000000000)) == 0)
 
-extern const LispObj ObjectT;
-extern const LispObj ObjectNIL;
+extern const CObject ObjectT;
+extern const CObject ObjectNIL;
 
 #define ArrayHeaderTag (0100 | TypeHeaderI)
 
@@ -130,7 +124,7 @@ typedef enum _ArrayElementType
 #define SetArrayRegisterEventCount(c,r) (dpb(ldb(22,0,c),27,0,r))
 
 #define BytePackingSize(b) (32>>(b))
-#define BytePackingRotation(b,i) (((~(-1<<(b)))&(i))<<(5-(b)))
+#define BytePackingRotation(b,i) ((CMask(b) & (i)) << (5-(b)))
 #define ArrayElementLdb(b,i,w) (ldb(BytePackingSize(b),BytePackingRotation(b,i),w))
 #define ArrayElementDpb(e,b,i,w) (dpb(e,BytePackingSize(b),BytePackingRotation(b,i),w))
 
@@ -647,7 +641,7 @@ typedef enum _ALUCondition
 } ALUCondition;
 
 #define PointerDataTypes 0xFFF4FFFFF8F7L
-#define PointerTypeP(t) (!(PointerDataTypes&(1<<t)))
+#define PointerTypeP(t) ((PointerDataTypes >> (t)) & 1)
 #define ReadVMAZoneNum(a) ldb(5,27,a)
 #define EphemeralAddressP(a) (!ReadVMAZoneNum(a))
 #define ReadVMAEphemeralHalf(a) ldb(1,26,a)
