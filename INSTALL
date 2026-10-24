@@ -33,6 +33,8 @@ Configuration options (pass -DNAME=VALUE to cmake -S . -B build):
                              or MinSizeRel for single-configuration generators
     BUILD_TESTING            ON by default; builds the Ivory instruction tests
     VLM_C_ENGINE             ON: direct C Ivory; OFF: generated Alpha interpreter
+    VLM_C_ICACHE_ENTRIES      65536: C decoded instruction cache entries;
+                             a power of two, at least 64 (ignored by Alpha)
     VLM_FAST                 ON: -Ofast in Release/RelWithDebInfo; OFF: -O2
     VLM_NATIVE               ON: -march=native; OFF: generic x86_64 code
     VLM_AUTOSTART            ON: boot the Genera world automatically
@@ -49,6 +51,8 @@ Configuration options (pass -DNAME=VALUE to cmake -S . -B build):
 Protocol debugging requires VLM_DEBUG_NETWORK=ON. Debug builds use CMake's
 normal debug flags; VLM_FAST affects only Release and RelWithDebInfo.
 The C engine always uses strict floating-point semantics, even with VLM_FAST=ON.
+The C decoded instruction cache uses 40 bytes per entry on x86_64 (2.5 MiB at
+the default size). Change VLM_C_ICACHE_ENTRIES to tune it for other workloads.
 VLM_NATIVE=OFF is useful when distributing binaries to other x86_64 machines.
 GNU C99 and -fno-strict-aliasing are required by the existing emulator code.
 

@@ -49,7 +49,10 @@ typedef struct _InstructionCacheLine
   struct _InstructionCacheLine *next_cp;
 } InstructionCacheLine;
 
-#define InstructionCacheSize 2048
+#ifndef VLM_C_ICACHE_ENTRIES
+#define VLM_C_ICACHE_ENTRIES 65536
+#endif
+#define InstructionCacheSize VLM_C_ICACHE_ENTRIES
 #define InstructionCacheLineSize 64
 
 /**** Processor state definitions ****/

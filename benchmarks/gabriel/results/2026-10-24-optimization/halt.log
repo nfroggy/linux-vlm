@@ -1,0 +1,11 @@
+genera (cold load init): using Xlib with xcb
+genera (POST): RunPOST
+genera (POST): OK 20000 0
+genera (cold load): presuming a US keyboard
+genera (cold load): NumLock modifier removed
+genera (cold load): Your Hyper(_R) key now is on (right) Menu
+genera (cold load): Your Meta key now is on ALT
+genera (cold load): NumLock will not be functional in genera
+genera (cold load): NumLock modifier removed
+genera: HALTED at instruction #52029653
+

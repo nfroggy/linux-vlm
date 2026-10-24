@@ -3,6 +3,7 @@
 #include "ivoryrep.h"
 #include "memory.h"
 #include "aihead.h"
+#include "traps.h"
 #include <limits.h>
 #include <math.h>
 
@@ -508,6 +509,84 @@ static void cleanup_fetch_fault(void)
   }
 }
 #endif
+/* Exercise each request field independently: the producer can publish the
+   payload before setting stop_interpreter, and a halt must outrank a trap. */
+#ifdef VLM_C_ENGINE
+static void interrupt_polling(void)
+{
+  extern void CImportState(void);
+  extern int CPollInterrupt(void);
+  for (unsigned mode=0;mode<4;++mode) {
+    reset();processor->control=2|(mode<<30);
+    processor->stop_interpreter=0;
+    CImportState();
+    CHECK(CPollInterrupt()==0);
+    processor->please_stop=HaltReason_SpyCalled;
+    CHECK(CPollInterrupt()==-1);
+    CHECK(processor->please_stop==0);
+    CHECK(CPollInterrupt()==0);
+
+    processor->please_trap=TrapReason_HighPrioritySequenceBreak;
+    CHECK(CPollInterrupt()==(mode<2 ? TrapVector_HighPrioritySequenceBreak : 0));
+    CHECK(processor->please_trap==0);
+    CHECK(CPollInterrupt()==0);
+    processor->please_trap=TrapReason_LowPrioritySequenceBreak;
+    CHECK(CPollInterrupt()==(mode==0 ? TrapVector_LowPrioritySequenceBreak : 0));
+    CHECK(processor->please_trap==0);
+    CHECK(CPollInterrupt()==0);
+
+    processor->interruptreg=1;
+    CImportState();
+    CHECK(CPollInterrupt()==0); /* A pending bit alone does not request a check. */
+    processor->stop_interpreter=1;
+    CHECK(CPollInterrupt()==(mode==0 ? TrapVector_PreemptRequest : 0));
+    CHECK(processor->stop_interpreter==0);
+    CHECK(CPollInterrupt()==0);
+
+    processor->please_stop=HaltReason_SpyCalled;
+    processor->please_trap=TrapReason_HighPrioritySequenceBreak;
+    processor->stop_interpreter=1;
+    CHECK(CPollInterrupt()==-1);
+    CHECK(processor->please_trap==TrapReason_HighPrioritySequenceBreak);
+    CHECK(CPollInterrupt()==(mode<2 ? TrapVector_HighPrioritySequenceBreak : 0));
+    CHECK(processor->stop_interpreter==0);
+    CHECK(processor->please_trap==0);
+    CHECK(CPollInterrupt()==0);
+  }
+}
+
+static void instruction_cache_boundaries(void)
+{
+  /* Cross both decode-block and cache-array boundaries, including a packed
+     odd PC. Then alternate two code locations that alias the same cache
+     entries, and verify explicit invalidation after modifying guest code. */
+  const Integer span=VLM_C_ICACHE_ENTRIES/2;
+  const Integer base=(code+span-1)&~(span-1);
+  EnsureVirtualAddressRange(base,2*span+64,FALSE);
+  const Integer edge=base+span-1;
+  reset();
+  pair(edge,halfword(Opcode_NoOp,0,0),halfword(Opcode_Push,3,20));
+  pair(edge+1,halfword(Opcode_Add,3,22),halfword(Opcode_Halt,0,0));
+  processor->epc=((uint64_t)edge<<1)|1;
+  CHECK(iInterpret((PROCESSORSTATEP)MapVirtualAddressTag(0))==HaltReason_Halted);
+  CHECK(num(0)==42);
+  CHECK(processor->epc==(((uint64_t)(edge+1)<<1)|1));
+
+  reset();
+  pair(base,halfword(Opcode_Push,3,17),halfword(Opcode_Halt,0,0));
+  pair(base+span,halfword(Opcode_Push,3,42),halfword(Opcode_Halt,0,0));
+  for (unsigned i=0;i<4;++i) {
+    processor->epc=(uint64_t)(base+(i&1)*span)<<1;
+    CHECK(iInterpret((PROCESSORSTATEP)MapVirtualAddressTag(0))==HaltReason_Halted);
+    CHECK(num(0)==((i&1)?42:17));
+  }
+  pair(base+span,halfword(Opcode_Push,3,99),halfword(Opcode_Halt,0,0));
+  flushicache();
+  processor->epc=(uint64_t)(base+span)<<1;
+  CHECK(iInterpret((PROCESSORSTATEP)MapVirtualAddressTag(0))==HaltReason_Halted);
+  CHECK(num(0)==99);
+}
+#endif
 int main(int argc, char **argv)
 {
   InitializeIvoryProcessor(MapVirtualAddressData(0), MapVirtualAddressTag(0));
@@ -524,6 +603,8 @@ int main(int argc, char **argv)
   puts("tail_return_cleanup");fflush(stdout);tail_return_cleanup();
   puts("traps");fflush(stdout);traps();
 #ifdef VLM_C_ENGINE
+  puts("interrupt_polling");fflush(stdout);interrupt_polling();
+  puts("instruction_cache_boundaries");fflush(stdout);instruction_cache_boundaries();
   puts("cleanup_fetch_fault");fflush(stdout);cleanup_fetch_fault();
 #endif
   printf("Ivory CPU tests passed (%u checks)\n",checks);

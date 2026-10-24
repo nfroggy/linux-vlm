@@ -1,0 +1,162 @@
+C interpreter optimization measurements, 2026-10-24
+
+Cheaper interrupt polling and a larger decoded instruction cache improve
+Gabriel throughput by 25.7% overall (1.2573x), reducing elapsed time by 20.5%.
+Polling alone improves throughput by 9.5% (1.0951x). The cache adds a further
+14.8% over the polling-only interpreter; these gains combine multiplicatively.
+The aggregate is the unweighted geometric mean of 29 workload time ratios.
+
+The combined version has lower median time on all 29 workloads. TAKR improves
+2.67x, FRPOLY10R2 1.90x, FRPOLY5R2 1.88x, DDERIV 1.58x, and BROWSE 1.49x.
+Small changes on individual workloads should be treated cautiously because
+host frequencies and background activity were not controlled exclusively.
+
+Relative to the unchanged Alpha-derived interpreter's earlier three boots,
+C's aggregate elapsed-time gap falls from 52.2% to 21.1%. The new C median is
+below Alpha for TAK, CTAK, and TAKR. FFT remains about 3.98x slower than Alpha;
+these changes do not address its floating-point handling overhead.
+
+Implementation
+
+CPollInterrupt first reads the three request fields with relaxed atomic loads.
+When all are clear it returns immediately, avoiding three atomic exchanges
+on the normal instruction path. Pending requests still use the original
+atomic exchanges, halt priority, and trap-mode checks. Every existing polling
+site remains in place, including polling on each guest instruction. The
+three fields are checked independently because a producer can publish a
+stop or trap payload before the stop_interpreter flag.
+
+The decoded instruction cache grows from 2048 to 65536 entries. The new
+VLM_C_ICACHE_ENTRIES CMake setting accepts a power of two of at least 64.
+At 40 bytes per entry, the default uses 2.5 MiB rather than 80 KiB. Cache
+indexing, decoding, invalidation, and the 64-entry fill block are unchanged.
+Floating-point semantics and the existing -fno-fast-math override are unchanged.
+
+Cache sizing
+
+Exploratory sizing used one fresh boot per candidate, seven samples per
+workload, compared against the earlier three-boot C baseline. All candidates
+include the polling change. cache-sizing.csv preserves this first-boot
+comparison separately from the repeated final measurements.
+
+Entries    Cache memory    Speedup over original C
+   2048        80 KiB       1.0906x  (poll-1)
+  16384       640 KiB       1.2376x
+  65536       2.5 MiB       1.2530x
+ 262144        10 MiB       1.2521x
+
+64K was chosen because it matched 256K overall with one-quarter the memory.
+Its additional benefit over 16K was concentrated in large-integer polynomial
+workloads. A single sizing boot is not enough to resolve very small differences
+between sizes; the selected 64K configuration was then repeated twice more.
+The setting remains configurable for other workloads and hosts.
+
+Repeated measurements
+
+Original C, polling-only C, optimized C, and Alpha each use the median of
+three boot medians, with seven timed batches per workload per boot. The
+original C and Alpha measurements are reused from ../2026-10-24. A new run
+of the exact original C executable differed from the earlier baseline by
+only 0.21% in aggregate (slower), recorded in baseline-check.csv.
+
+Per-boot aggregate speedups against the fixed original C median were:
+  Polling only: 1.0906x, 1.1054x, 1.0897x
+  Poll + 64K:   1.2530x, 1.2799x, 1.2492x
+These ranges describe observed variation, not statistical confidence intervals.
+
+Times below are milliseconds per canonical suite invocation, not per inner
+loop iteration. Speedup is original C time / optimized C time. summary.csv
+also records every variant's minimum and maximum boot median.
+
+Benchmark          Original C     Poll only    Poll + 64K       Alpha   Speedup
+BOYER                 93.9611       84.3398       80.4504     68.5773    1.168x
+BROWSE               207.2671      192.9376      139.2016    110.5425    1.489x
+DESTRU                16.2538       14.9437       14.2477     11.4637    1.141x
+TRAVERSE-INIT         50.4947       48.4476       48.4476     40.0318    1.042x
+TRAVERSE             279.9386      270.7267      270.2149    243.6029    1.036x
+TAK                    3.9948        3.3687        3.2594      3.5774    1.226x
+STAK                  16.2538       15.9672       15.9263     11.0952    1.021x
+CTAK                  58.9267       44.5972       44.7434     47.3753    1.317x
+TAKL                  40.1042       38.1502       38.0571     32.7533    1.054x
+TAKR                   9.3029        8.4840        3.4800      3.6165    2.673x
+DERIV                 28.8639       26.9533       19.6520     17.3320    1.469x
+DDERIV                35.5681       33.0092       22.5179     19.9591    1.580x
+DIV2-I                15.3531       14.7087       14.5949     12.6995    1.052x
+DIV2-R                17.7840       16.8458       16.9737     15.3105    1.048x
+FFT                   71.8185       69.4302       68.5773     17.2296    1.047x
+PUZZLE               274.8209      231.8321      231.8321    217.5026    1.185x
+TRIANG              1079.8362      930.3992      927.3286    787.1034    1.164x
+FRPOLY2R               0.0312        0.0280        0.0274      0.0240    1.140x
+FRPOLY2R2              0.0753        0.0680        0.0453      0.0417    1.664x
+FRPOLY2R3              0.0344        0.0313        0.0307      0.0242    1.122x
+FRPOLY5R               0.3308        0.3036        0.3003      0.2559    1.101x
+FRPOLY5R2              2.5917        2.4014        1.3778      1.2204    1.881x
+FRPOLY5R3              0.3722        0.3393        0.3412      0.2557    1.091x
+FRPOLY10R              3.5598        3.2427        3.2246      2.7717    1.104x
+FRPOLY10R2            38.4293       35.9170       20.1917     17.6794    1.903x
+FRPOLY10R3             4.1151        3.8122        3.8017      2.8513    1.082x
+FRPOLY15R             23.6017       21.7352       21.4342     18.6044    1.101x
+FRPOLY15R2           222.6203      193.9611      138.6899    120.7779    1.605x
+FRPOLY15R3            27.9086       25.8615       25.9297     18.2873    1.076x
+
+Protocol and reproducibility
+
+Same Ryzen 7 PRO 7840U host, GCC 16.2.1, Release, VLM_FAST=ON, VLM_NATIVE=ON,
+logical CPU 6, nice 10, powersave governor with boost enabled, and Genera 8.6
+world as the baseline experiment. The CPU was not isolated and frequencies
+were not locked. No host builds ran during timed measurements. Tests used
+one disposable Genera at a time on a private Xvfb display with GLX disabled.
+
+The same compiled suite.vbin and driver.vbin were reused without recompiling.
+World, guest code, source, and fixed batch-count hashes were verified unchanged.
+The suite's original TIMED-DURATION measures elapsed REAL ticks at 977 Hz;
+loading, compilation, warm-up, and file I/O are outside the measured intervals.
+Ephemeral GC is enabled and dynamic GC disabled. See ../../README for the
+full protocol. These results measure Gabriel workloads, not interactive speed.
+
+Nine additional boots produced 1827 timed batches, each lasting 0.153-1.095 s:
+  poll-1, cache16k-1, cache64k-1, cache256k-1, baselinecheck-1,
+  poll-2, cache64k-2, poll-3, cache64k-3.
+Every boot reached the completion marker and exited with status 0. All saved
+warm-up return values match the original C and Alpha results byte-for-byte.
+
+The baseline binary was preserved before editing. All optimized binaries
+were built from the same changes, with only VLM_C_ICACHE_ENTRIES varied.
+The final build/src/genera is byte-identical to the measured 64K executable.
+metadata.json records hashes, settings, run order, and derived aggregates.
+
+Recompute the final comparison from the repository root:
+
+  python3 benchmarks/gabriel/compare.py \
+    --group 'baseline=benchmarks/gabriel/results/2026-10-24/c-[123].csv' \
+    --group 'poll=benchmarks/gabriel/results/2026-10-24-optimization/poll-[123].csv' \
+    --group 'optimized=benchmarks/gabriel/results/2026-10-24-optimization/cache64k-[123].csv' \
+    --group 'alpha=benchmarks/gabriel/results/2026-10-24/alpha-[123].csv' \
+    --output benchmarks/gabriel/results/2026-10-24-optimization/summary.csv
+
+For new measurements, build the polling-only variant with
+-DVLM_C_ICACHE_ENTRIES=2048 and the combined variant with 65536. Use run.py
+with seven samples, the same counts.json, the same compiled guest code, and
+new run labels. The original baseline used commit a183dd8 before these edits.
+
+Validation
+
+The final CTest suite passed all 1536 CPU checks, including new checks for
+independently published interrupt requests, all four trap modes, halt
+priority, cache collisions, packed odd-PC boundary crossings, and explicit
+invalidation after guest code modification. The cache-size checks passed
+at 16K, 64K, and 256K entries. CMake rejects too-small, non-power-of-two,
+and nonnumeric sizes (tested with 32, 96, and "no").
+
+The interactive regression logged in as lisp-machine, forced the BAR/GC
+regression in tests/bar-gc.lisp, opened Genera Concepts, Genera User's Guide,
+and Genera Workbook, and ran Help Commands :Format Full. The GC assertion
+passed and all documents and command output displayed without a Lisp trap.
+A separate Halt Genera check completed its FEP confirmation and exited with
+status 0, without the former stack-overflow diagnostic.
+
+The first document-test helper reached the SIGTERM exit confirmation but
+exceeded its three-second cleanup timeout and was killed by the helper. The
+full document/GC test was repeated with a 15-second cleanup timeout and exited
+with status 0. This cleanup observation is separate from the passing guest
+checks and the clean Halt Genera test; both attempts' host logs are retained.

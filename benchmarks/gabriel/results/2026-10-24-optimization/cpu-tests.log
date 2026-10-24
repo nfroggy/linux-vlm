@@ -1,0 +1,79 @@
+Start testing: Oct 24 17:44 EDT
+----------------------------------------------------------
+1/1 Testing: ivory-cpu
+1/1 Test: ivory-cpu
+Command: "/home/nathan/dev/linux-vlm/build/src/cpu-test"
+Directory: /home/nathan/dev/linux-vlm/build/src
+"ivory-cpu" start time: Oct 24 17:44 EDT
+Output:
+----------------------------------------------------------
+genera (cold load init): using Xlib with xcb
+genera (POST): RunPOST
+genera (POST): OK 20000 0
+arithmetic
+host_memory_barriers
+genera: HALTED at instruction #2080055
+
+genera: HALTED at instruction #2080057
+
+genera: HALTED at instruction #2080059
+
+genera: HALTED at instruction #2080061
+
+genera: HALTED at instruction #2080063
+
+genera: HALTED at instruction #2080065
+
+genera: HALTED at instruction #2080067
+
+genera: HALTED at instruction #2080069
+
+genera: HALTED at instruction #2080071
+
+genera: HALTED at instruction #2080073
+
+genera: HALTED at instruction #2080075
+
+genera: HALTED at instruction #2080077
+
+genera: HALTED at instruction #2080079
+
+genera: HALTED at instruction #2080081
+
+genera: HALTED at instruction #2080083
+
+addressing_and_cache
+double_float
+function_calls
+single_float
+bindings
+instance_and_cleanup
+tail_return_cleanup
+traps
+genera: HALTED at instruction #2080204
+
+genera: HALTED at instruction #2080206
+
+genera: HALTED at instruction #2080208
+
+interrupt_polling
+instruction_cache_boundaries
+cleanup_fetch_fault
+genera: HALTED at instruction #2080246
+
+genera: HALTED at instruction #2080253
+
+genera: HALTED at instruction #2080260
+
+genera: HALTED at instruction #2080267
+
+Ivory CPU tests passed (1536 checks)
+<end of output>
+Test time =   0.28 sec
+----------------------------------------------------------
+Test Passed.
+"ivory-cpu" end time: Oct 24 17:44 EDT
+"ivory-cpu" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Oct 24 17:44 EDT

@@ -93,6 +93,15 @@ void CFlushInstructionCache(void)
 
 int CPollInterrupt(void)
 {
+  /* The usual case is idle. Avoid three read/modify/write operations on
+     shared cache lines for every guest instruction. A request published
+     after its load is checked at the next instruction; pending requests
+     still use the existing atomic consume path below. Check each flag:
+     the stop/trap fields can be published before stop_interpreter. */
+  if (!__atomic_load_n(&processor->please_stop, __ATOMIC_RELAXED) &&
+      !__atomic_load_n(&processor->stop_interpreter, __ATOMIC_RELAXED) &&
+      !__atomic_load_n(&processor->please_trap, __ATOMIC_RELAXED))
+    return 0;
   if (__atomic_exchange_n(&processor->please_stop, 0, __ATOMIC_RELAXED)) return -1;
   int requested = __atomic_exchange_n(&processor->stop_interpreter, 0, __ATOMIC_RELAXED);
   int trap = __atomic_exchange_n(&processor->please_trap, 0, __ATOMIC_RELAXED);

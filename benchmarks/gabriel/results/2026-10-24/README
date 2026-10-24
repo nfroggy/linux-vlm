@@ -1,0 +1,121 @@
+Gabriel benchmark comparison, 2026-10-24
+
+The generated Alpha-derived interpreter was 1.522x faster than the direct C
+interpreter by the geometric mean of all 29 workload time ratios. C took
+52.2% more elapsed time, equivalent to 65.7% of Alpha's throughput on
+this aggregate. Alpha was faster on every workload in this experiment.
+
+The three matched boot pairs gave aggregate ratios of 1.523x, 1.501x, and
+1.533x. The largest gaps were FFT (4.17x), TAKR (2.57x), and FRPOLY with
+large integer coefficients (up to 2.17x). TAK had the smallest gap (1.12x).
+Excluding FFT, the aggregate was 1.468x. The 17 non-FRPOLY workloads gave
+1.503x; the 12 FRPOLY variants gave 1.549x. The overall result therefore does
+not depend solely on FFT or the number of polynomial variants.
+
+Times below are milliseconds per canonical suite invocation. For example,
+the suite's FFT invocation performs 10 transforms. Each value is the median
+of three boot medians; each boot median uses seven batched samples. Range
+columns show the smallest and largest boot medians, not confidence intervals.
+C/Alpha greater than 1 means the C interpreter takes longer.
+
+Benchmark           Alpha ms       C ms    C/Alpha    Alpha boot range ms      C boot range ms
+BOYER                68.5773    93.9611     1.370      68.3726-  69.1914      93.3470-  94.5752
+BROWSE              110.5425   207.2671     1.875     110.0307- 111.0542     206.2436- 210.8495
+DESTRU               11.4637    16.2538     1.418      11.4227-  11.5455      16.2129-  16.2948
+TRAVERSE-INIT        40.0318    50.4947     1.261      39.8044-  44.4672      49.9261-  51.0633
+TRAVERSE            243.6029   279.9386     1.149     243.6029- 252.8147     278.4033- 282.4974
+TAK                   3.5774     3.9948     1.117       3.5774-   3.5973       3.9749-   4.0246
+STAK                 11.0952    16.2538     1.465      11.0542-  11.0952      15.5169-  16.4585
+CTAK                 47.3753    58.9267     1.244      47.2291-  47.3753      58.7805-  65.6529
+TAKL                 32.7533    40.1042     1.224      32.6603-  33.0325      39.4529-  40.1973
+TAKR                  3.6165     9.3029     2.572       3.5710-   3.6165       9.2801-   9.4621
+DERIV                17.3320    28.8639     1.665      17.2637-  17.4002      28.7956-  29.2050
+DDERIV               19.9591    35.5681     1.782      19.7885-  20.1296      35.1416-  36.8475
+DIV2-I               12.6995    15.3531     1.209      12.5479-  12.7374      15.2015-  15.3910
+DIV2-R               15.3105    17.7840     1.162      15.2678-  15.3958      17.6134-  18.2105
+FFT                  17.2296    71.8185     4.168      17.0590-  19.7885      71.8185-  72.6714
+PUZZLE              217.5026   274.8209     1.264     216.4790- 223.1320     271.2385- 275.3327
+TRIANG              787.1034  1079.8362     1.372     787.1034- 797.3388    1067.5537-1123.8485
+FRPOLY2R              0.0240     0.0312     1.299       0.0240-   0.0243       0.0310-   0.0313
+FRPOLY2R2             0.0417     0.0753     1.806       0.0415-   0.0424       0.0749-   0.0755
+FRPOLY2R3             0.0242     0.0344     1.421       0.0241-   0.0245       0.0344-   0.0348
+FRPOLY5R              0.2559     0.3308     1.293       0.2534-   0.2592       0.3299-   0.3308
+FRPOLY5R2             1.2204     2.5917     2.124       1.2138-   1.2269       2.5851-   2.6048
+FRPOLY5R3             0.2557     0.3722     1.456       0.2547-   0.2603       0.3694-   0.3741
+FRPOLY10R             2.7717     3.5598     1.284       2.7627-   2.8170       3.5507-   3.5869
+FRPOLY10R2           17.6794    38.4293     2.174      17.5863-  18.0515      38.3363-  38.4293
+FRPOLY10R3            2.8513     4.1151     1.443       2.7677-   2.9035       4.1046-   4.1464
+FRPOLY15R            18.6044    23.6017     1.269      18.0625-  19.0258      23.3006-  23.6017
+FRPOLY15R2          120.7779   222.6203     1.843     120.7779- 122.3132     221.5967- 225.1791
+FRPOLY15R3           18.2873    27.9086     1.526      18.1508-  18.3555      27.8403-  27.9768
+
+Host and builds
+
+AMD Ryzen 7 PRO 7840U, Linux 7.2.11-200.fc44.x86_64, GCC 16.2.1.
+Both executables used the repository's Release defaults: VLM_FAST=ON,
+VLM_NATIVE=ON, -O3 -DNDEBUG -Ofast -march=native, with VLM_C_ENGINE toggled.
+The C core retains its existing -fno-fast-math override for IEEE semantics.
+No emulator code or build flags were changed for this experiment.
+
+C executable: /home/nathan/dev/linux-vlm/build/src/genera
+Alpha executable: /tmp/vlm-alpha-check/src/genera
+Repository commit: a183dd8 (full revision and hashes in metadata.json).
+"Alpha" denotes this repository's generated interpreter running as compiled
+x86-64 code. This is not a comparison with native Alpha hardware.
+
+Both used /home/nathan/dev/Genera-8-6.vlod, -vm 1024, the same TAP setup,
+-spy no, and a private Xvfb display with GLX disabled. Genera and its helper
+threads were pinned to logical CPU 6 at nice level 10. The CPU governor was
+powersave, with boost enabled; frequencies were not locked and the CPU was
+not reserved exclusively. Other host tasks could introduce timing noise.
+
+Measurement protocol
+
+The unmodified public-domain Symbolics Gabriel suite (revision 19) supplied
+all 29 non-I/O workloads. suite.vbin and driver.vbin were compiled once on
+the C interpreter before measurement, then reused unchanged by all six
+fresh boots. World, executable, source, compiled-code, and batch-count hashes
+were checked unchanged across the experiment and are recorded in metadata.
+The run order was C1, Alpha1, Alpha2, C2, C3, Alpha3.
+
+The custom driver uses fixed batches from ../../counts.json, one untimed
+warm-up per workload, and seven measured batches per boot. There are
+1218 measured batches in total, 21 per workload per engine. Batch durations
+ranged from 0.102 to 1.185 seconds, comfortably above the roughly 1 ms timer
+resolution. All samples, including early slow samples, are preserved.
+
+Timing uses the original suite's TIMED-DURATION. Scheduling and oldspace
+reclamation occur before timing; guest preemption is inhibited in the timed
+batch. Ephemeral GC is enabled and dynamic GC disabled. The same batch-loop
+and FUNCALL overhead is included for both interpreters. Compilation,
+loading, warm-up, file writes, and screen updates are outside the intervals.
+
+REAL is elapsed time, converted using Genera's declared 977 ticks/second.
+RUN is also saved but is Genera's adjusted runtime, not Linux CPU time.
+The comparison uses REAL. This protocol reports medians rather than the
+original RUN-SERIES minimum-time statistic; these are Gabriel workload
+measurements, not a reproduction of the original minimum-time score.
+
+Boyer's first few samples were slower on both engines. Boot medians reduce
+that effect without removing samples. Some boot medians varied more than
+others, especially Alpha FFT and C CTAK; the full ranges are shown above.
+The aggregate was consistent across all three pairs. These measurements
+cover compute/memory workloads, not interactive responsiveness or I/O.
+
+Validation and artifacts
+
+Both builds passed their CTest suites before benchmarking (C: ivory-cpu;
+Alpha: ivory-cpu and float-conversion). All 29 saved warm-up return values
+matched byte-for-byte across both interpreters and all boots. This checks
+returned results, not every internal side effect. All six runs reached the
+completion marker and their host processes exited cleanly. No test Genera
+instance remains running.
+
+*-1/2/3.csv contain the raw samples; *.csv.values.gz contain the saved return
+values; *.log and *-complete.txt record host output and guest completion.
+summary.csv contains the derived comparison, and metadata.json records the
+host, inputs, settings, and file hashes. Run from the repository root:
+
+  python3 benchmarks/gabriel/analyze.py benchmarks/gabriel/results/2026-10-24
+
+See ../../README for the build and guest-run reproduction procedure.

@@ -1,0 +1,113 @@
+Gabriel benchmarks in Genera
+===========================
+
+suite.lisp is the unmodified, public-domain Symbolics Common Lisp version of
+Richard Gabriel's benchmark suite. The installed source was:
+  /var/lib/symbolics/rel-8-6/sys.sct/examples/gabriel-benchmarks.lisp.~19~
+Its header credits Charlie Hornig and Dan Weinreb. It selects 29 non-I/O
+workloads; the 12 FRPOLY cases are separate workloads in that selection.
+
+driver.lisp calls those original timing functions. Each workload gets one
+untimed warm-up, then seven timed batches. counts.json fixes the number of
+calls in each batch, identically for both interpreters. The counts were
+calibrated on this host to target at least 0.4 seconds in the C interpreter;
+the quicker Alpha samples also stay well above the timer's resolution.
+
+Timing uses the suite's TIMED-DURATION unchanged: it permits scheduling and
+reclaims GC oldspace before timing, then inhibits guest preemption during
+the batch. Ephemeral GC is enabled and dynamic GC disabled in both engines.
+Warm-up return values are saved separately to compare the engines. File I/O,
+compilation, loading, and warm-up are excluded from the reported intervals.
+
+REAL ticks are elapsed time. RUN ticks are Genera's adjusted runtime, not
+Linux process CPU time. The comparison uses REAL. Genera's declared rate is
+977 ticks/second, approximately 1.024 ms/tick. The driver uses binary writes
+for plain ASCII CSV, avoiding Genera's character-style escapes on append.
+
+run.py starts a private Xvfb server with GLX disabled, boots the supplied
+binary, logs in as lisp-machine, loads the driver through the existing NFS
+export, collects results, and stops only that test instance. It refuses to
+start if another genera process is running. It pins Genera and its helper
+threads to one logical CPU (default 6), uses nice level 10, disables core
+dumps, limits output file size, and imposes a timeout. The desktop display
+is not used. Requirements: libX11, Xvfb, ImageMagick's import, taskset, pgrep,
+and the already configured TAP interface and guest-accessible NFS export.
+Defaults reflect the benchmark machine; paths, CPU, display, and network
+can be overridden with command-line options.
+
+Build matching Release versions, changing only VLM_C_ENGINE:
+
+  cmake -S . -B build-bench/c -DCMAKE_BUILD_TYPE=Release -DVLM_C_ENGINE=ON
+  cmake -S . -B build-bench/alpha -DCMAKE_BUILD_TYPE=Release -DVLM_C_ENGINE=OFF
+  cmake --build build-bench/c --parallel 2
+  cmake --build build-bench/alpha --parallel 2
+  ctest --test-dir build-bench/c --output-on-failure
+  ctest --test-dir build-bench/alpha --output-on-failure
+
+The default VLM_FAST=ON and VLM_NATIVE=ON apply to both. The direct C core's
+existing -fno-fast-math override remains in effect for IEEE semantics.
+"Alpha" means the repository's generated Alpha-derived interpreter compiled
+for x86-64, not native execution on Alpha hardware.
+
+For a new experiment, choose a fresh directory beneath the existing export
+and pass matching --export-dir and --guest-dir values. Compile ONCE with
+--compile, on either interpreter, then omit --compile for all measured boots
+so they load exactly the same suite.vbin and driver.vbin. Do not overwrite
+old compiled output: Genera's NFS file-version handling can fail on repeated
+replacement. The runner checks this before launching.
+
+Example preparation run (excluded from reported results):
+
+  python3 benchmarks/gabriel/run.py ./build-bench/c/src/genera \
+    --label preparation --compile --samples 1 \
+    --counts benchmarks/gabriel/counts.json \
+    --export-dir /var/lib/symbolics/new-gabriel-run \
+    --guest-dir CHESTNUT:/var/lib/symbolics/new-gabriel-run
+
+Run six fresh boots, in order C1, Alpha1, Alpha2, C2, C3, Alpha3. For each,
+use the appropriate binary and --label c-1, alpha-1, alpha-2, c-2, c-3, or
+alpha-3. Use the same export/guest paths and these arguments each time:
+
+  --samples 7 --counts benchmarks/gabriel/counts.json --timeout 300
+
+Each label must be new. Data defaults to build-bench/results. Analyze with:
+
+  python3 benchmarks/gabriel/analyze.py build-bench/results
+
+analyze.py validates the complete sample set, batch counts, clock rate, and
+matching warm-up return values. It computes each boot's median seconds per
+canonical suite call, then the median of the three boot medians. summary.csv
+also includes the minimum and maximum boot medians. C/Alpha above 1 means
+the C engine takes longer. The aggregate is the geometric mean of the 29
+individual time ratios, giving each suite entry equal weight. It is not a
+prediction of interactive application performance or startup time.
+
+The dated results directory records the actual hardware, build settings,
+binary/world/source hashes, raw timing samples, and conclusions for this run.
+
+Comparing C optimizations
+------------------------
+
+VLM_C_ICACHE_ENTRIES sets the C engine's decoded instruction cache size at
+configure time. Use the same build flags, guest binaries, counts, and host
+settings when comparing sizes. Run variants sequentially, without compiling
+on the host during measured runs. Preserve the original executable to make
+a subsequent baseline check possible.
+
+compare.py applies the same validation and aggregation to arbitrary groups
+of fresh boots. Quote each glob so the shell does not expand it. For example:
+
+  python3 benchmarks/gabriel/compare.py \
+    --group 'baseline=build-bench/results/baseline-*.csv' \
+    --group 'poll=build-bench/results/poll-*.csv' \
+    --group 'cache16k=build-bench/results/cache16k-*.csv' \
+    --output build-bench/results/comparison.csv
+
+The first group is the baseline. Speedup is baseline time / variant time;
+1.10x means 10% more throughput, or 9.09% less elapsed time. Each group can
+have a different number of boots; use repeated boots for final conclusions
+and label single-boot cache sizing experiments as exploratory.
+
+results/2026-10-24-optimization records the polling and cache-size experiment,
+including separate contributions, repeated measurements, and the comparison
+with the original C and Alpha results in results/2026-10-24.

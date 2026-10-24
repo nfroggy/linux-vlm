@@ -1,0 +1,207 @@
+{
+  "completed_benchmarks": "2026-10-24T17:51:04.232921-04:00",
+  "base_commit": "a183dd81246104c635f8f49d9a88eaa48a0ecbe1",
+  "baseline_metadata": "../2026-10-24/metadata.json",
+  "baseline_samples": "../2026-10-24/c-[123].csv",
+  "alpha_samples": "../2026-10-24/alpha-[123].csv",
+  "host": "Linux chestnut 7.2.11-200.fc44.x86_64 #1 SMP PREEMPT_DYNAMIC Thu Oct 15 15:58:58 UTC 2026 x86_64 GNU/Linux",
+  "compiler": "gcc (GCC) 16.2.1 20260819 (Red Hat 16.2.1-2)",
+  "cpu": "AMD Ryzen 7 PRO 7840U",
+  "cpu_affinity": 6,
+  "cpu_isolated": false,
+  "governor": "powersave",
+  "nice": 10,
+  "build_type": "Release",
+  "VLM_FAST": true,
+  "VLM_NATIVE": true,
+  "compiler_flags": {
+    "common": "-O3 -DNDEBUG -std=gnu99 -Wall -fno-strict-aliasing -march=native -Ofast",
+    "c_core_override": "-fno-fast-math"
+  },
+  "gc": {
+    "ephemeral": true,
+    "dynamic": false
+  },
+  "display": ":99, Xvfb 1920x1200x24, GLX disabled",
+  "vm_megabytes": 1024,
+  "guest_login": "lisp-machine",
+  "unchanged_inputs": {
+    "world": {
+      "path": "/home/nathan/dev/Genera-8-6.vlod",
+      "sha256": "dab4eac04b9303a8d0f865bfd4ad1c57d3137b4adf20cf2d29b03012b0e5d203",
+      "size": 62259200
+    },
+    "suite_source": {
+      "path": "/home/nathan/dev/linux-vlm/benchmarks/gabriel/suite.lisp",
+      "sha256": "757ab4dd1f1243d1dd8cf591ea2b6a428fe42563087cb6c26c523ca25dd861d6",
+      "size": 78960
+    },
+    "suite_vbin": {
+      "path": "/var/lib/symbolics/vlm-gabriel-20261024/suite.vbin",
+      "sha256": "08711e0f312f0fb5a7f0026698fe9768b5d10d4d03b1368d8ff47dccf0681518",
+      "size": 60422
+    },
+    "driver_source": {
+      "path": "/home/nathan/dev/linux-vlm/benchmarks/gabriel/driver.lisp",
+      "sha256": "be3affa72d589fa36ff6e890f871298d5d69962f4816cf12938bbecc385babf3",
+      "size": 2418
+    },
+    "driver_vbin": {
+      "path": "/var/lib/symbolics/vlm-gabriel-20261024/driver.vbin",
+      "sha256": "f89c370d7b386d9b41a5bf3461e75a2b22c3943d657247858e773f237d8025f6",
+      "size": 3134
+    },
+    "counts": {
+      "path": "/home/nathan/dev/linux-vlm/benchmarks/gabriel/counts.json",
+      "sha256": "1b67ba766914b8ebd399a186251150d03f7eb182898673f52c533085870768a2",
+      "size": 504
+    }
+  },
+  "variants": {
+    "baseline": {
+      "path": "/home/nathan/dev/linux-vlm/build-bench/baseline/src/genera",
+      "sha256": "571299d45e6874f28804626ed8bbbd27fe107a7b0478aaa28e0313e8fc3f6f7e",
+      "icache_entries": 2048,
+      "icache_bytes": 81920,
+      "idle_poll_loads": false
+    },
+    "poll": {
+      "path": "/home/nathan/dev/linux-vlm/build-bench/poll/src/genera",
+      "sha256": "44ad55d94edcabdbec1d685e06120e9ff0bbb8ea81be749e7331e2900dd242c1",
+      "icache_entries": 2048,
+      "icache_bytes": 81920,
+      "idle_poll_loads": true
+    },
+    "cache16k": {
+      "path": "/home/nathan/dev/linux-vlm/build-bench/cache16k/src/genera",
+      "sha256": "c1a1030305e7dd3f637a46e24faf1318d60e9656682e446dd8ed98816405aece",
+      "icache_entries": 16384,
+      "icache_bytes": 655360,
+      "idle_poll_loads": true
+    },
+    "cache64k": {
+      "path": "/home/nathan/dev/linux-vlm/build-bench/cache64k/src/genera",
+      "sha256": "42042d53434c90117135a22b941db4ba8082eb1d2f569192731675b2328c896a",
+      "icache_entries": 65536,
+      "icache_bytes": 2621440,
+      "idle_poll_loads": true
+    },
+    "cache256k": {
+      "path": "/home/nathan/dev/linux-vlm/build-bench/cache256k/src/genera",
+      "sha256": "34a910055790635201b63d52d4dcc91730b3445bd4d298d9f5400b1822cd378f",
+      "icache_entries": 262144,
+      "icache_bytes": 10485760,
+      "idle_poll_loads": true
+    }
+  },
+  "default_cache_entries": 65536,
+  "final_binary": "build/src/genera",
+  "boot_order": [
+    "poll-1",
+    "cache16k-1",
+    "cache64k-1",
+    "cache256k-1",
+    "baselinecheck-1",
+    "poll-2",
+    "cache64k-2",
+    "poll-3",
+    "cache64k-3"
+  ],
+  "samples_per_workload_per_boot": 7,
+  "aggregation": "median of seven samples per boot, then median of three boot medians; unweighted geometric mean of 29 time ratios",
+  "sizing_runs": "cache16k-1, cache64k-1, cache256k-1: one exploratory boot each",
+  "measured_batches_this_experiment": 1827,
+  "batch_seconds_range": [
+    0.15250767656090072,
+    1.0951893551688843
+  ],
+  "return_values_sha256": "966651030de837caec7e8571f244cff6ae6a5e1cc441e0f860ad2a2f745b0965",
+  "runs": {
+    "poll-1": {
+      "variant": "poll",
+      "samples": 203,
+      "exit_status": 0,
+      "csv_sha256": "2e25431b514731795423d72907d7edfa345ff2dc1073a0c2a5c8c2f3e1d50c1c"
+    },
+    "cache16k-1": {
+      "variant": "cache16k",
+      "samples": 203,
+      "exit_status": 0,
+      "csv_sha256": "c7ec189d1a73d3707497b106b1f8225a33035b27e05ddbb80c481a0f3a693dbd"
+    },
+    "cache64k-1": {
+      "variant": "cache64k",
+      "samples": 203,
+      "exit_status": 0,
+      "csv_sha256": "7dbcf8e3ad02f38d14a9c9ba75b7da980dd0435ed5d0afe3756bcf1a67d0be51"
+    },
+    "cache256k-1": {
+      "variant": "cache256k",
+      "samples": 203,
+      "exit_status": 0,
+      "csv_sha256": "ffaa29973fa3f5e985cfa8e8d78f9c301d52d738bb83ab512a419dc22f9bb52e"
+    },
+    "baselinecheck-1": {
+      "variant": "baseline",
+      "samples": 203,
+      "exit_status": 0,
+      "csv_sha256": "0b8fc9c4cac3e7934de93774f959c748713a8a24c43c799e4e86fae9688c983d"
+    },
+    "poll-2": {
+      "variant": "poll",
+      "samples": 203,
+      "exit_status": 0,
+      "csv_sha256": "e7391d7e53c5fa4ad18a46a23d132b3bc115aa7bb1a6f8fa7fe048c15e84a3ea"
+    },
+    "cache64k-2": {
+      "variant": "cache64k",
+      "samples": 203,
+      "exit_status": 0,
+      "csv_sha256": "66c91697493c02d8a6c90b5bb1946f9752c3896b93b2b51d2ecda77979c694c4"
+    },
+    "poll-3": {
+      "variant": "poll",
+      "samples": 203,
+      "exit_status": 0,
+      "csv_sha256": "ca9dde9575e3498baff7cfa9186013204e57294268951e13eaf3ac78c27627c9"
+    },
+    "cache64k-3": {
+      "variant": "cache64k",
+      "samples": 203,
+      "exit_status": 0,
+      "csv_sha256": "19ebb9be15d6cca887407726ef347c3c9eab547f6a3a10f053974fdb65120b73"
+    }
+  },
+  "results": {
+    "poll_speedup": 1.0951101600212754,
+    "combined_speedup": 1.2572620286090281,
+    "cache_incremental_speedup": 1.1480690021034985,
+    "combined_time_reduction": 0.20462085289702892,
+    "optimized_over_alpha": 1.2105994949399348,
+    "optimized_faster_than_baseline": 29,
+    "optimized_faster_than_alpha": 3
+  },
+  "source_sha256": {
+    "c-emulator/host.c": "8b1000390d9f6c9b3b69655fcab3c4c0eb17e48c5896a280dbbcca409bae51d4",
+    "c-emulator/emulator.h": "9d36589454354ce673e50c3eca82b4d311b8021f0aa59f07aa1429bae4983adc",
+    "c-emulator/CMakeLists.txt": "5bcce20cf9086610f085ed35bb00243f3a4cfb2d148132bc92ea84f59d6591cc",
+    "tests/cpu.c": "22defbbe908933b3d049ae781795d6e8d13b6d198b65c6f26f55dc7509cf8dc7"
+  },
+  "validation": {
+    "ivory_cpu": "passed, 1536 checks",
+    "invalid_cache_sizes": "32, 96, and nonnumeric input rejected",
+    "document_gc_help": {
+      "status": "passed; screenshots inspected",
+      "steps": [
+        "Login lisp-machine",
+        "Enable ephemeral GC and run tests/bar-gc.lisp",
+        "Open Genera Concepts, Genera User\u2019s Guide, and Genera Workbook",
+        "Help Commands :Format Full"
+      ],
+      "first_cleanup": "SIGTERM confirmation reached, but the helper killed the instance after its 3-second timeout",
+      "repeat_cleanup": "exited with status 0 with a 15-second timeout"
+    },
+    "halt_genera": "passed; FEP confirmation completed, exit 0, no stack-overflow diagnostic"
+  },
+  "completed_validation": "2026-10-24T17:55:22.032967-04:00"
+}
