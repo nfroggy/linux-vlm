@@ -32,7 +32,6 @@ option(VLM_DEBUG_NETWORK "Enable network debugging" OFF)
 foreach(protocol IP CHAOS ARP ICMP)
     option(VLM_DEBUG_NETWORK_${protocol} "Enable ${protocol} network debugging" OFF)
 endforeach()
-option(VLM_REGENERATE_STUBS "Regenerate interpreter sources with CLISP" OFF)
 
 include(cmake/Dependencies.cmake)
 include(GNUInstallDirs)

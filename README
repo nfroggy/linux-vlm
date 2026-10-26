@@ -58,7 +58,7 @@ there are extensions for:
       You won't be able to use these extensions if you do not patch and
       recompile respective the LISP definitions as well.
 
-To build on x86_64 Linux, install GCC, CMake 3.20 or newer, Make or Ninja,
+To build on x86_64 Linux, install GCC, CLISP, CMake 3.20 or newer, Make or Ninja,
 and the development headers and libraries for X11 (including Xlib-xcb) and
 libcrypt. Then run:
 
@@ -76,10 +76,10 @@ The default Release build preserves -Ofast and -march=native. Use
 -DCMAKE_BUILD_TYPE=Debug for debugging, -DVLM_FAST=OFF for -O2 in Release,
 or -DVLM_NATIVE=OFF to build for other x86_64 CPUs. See INSTALL for all options.
 
-CLISP is optional when using the checked-in interpreter sources. To regenerate
-them from the Alpha assembler and Lisp macros, configure with
--DVLM_REGENERATE_STUBS=ON. Generated C files go into build/stub and are rebuilt
-when their inputs change; the checked-in copies are not overwritten.
+The build uses CLISP to generate the interpreter C sources from the Alpha
+assembler and Lisp macros. Generated files go into build/stub and are rebuilt
+when their inputs change; they are not stored in the repository. To run just
+the generation step, use cmake --build build --target generate-stubs.
 
 To check shutdown with a real world, prefix your normal ./build/src/genera command
 with "python3 tests/shutdown.py --". This requires a working X display and TAP

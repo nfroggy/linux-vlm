@@ -2,3 +2,9 @@
 /build/
 /build-*/
 /CMakeUserPresets.json
+
+# Generated interpreter sources from standalone generator runs.
+/stub/ifun*.c
+/stub/idispat.c
+/stub/idouble.c
+/stub/ihalt.c

@@ -1,9 +1,8 @@
 Building and installing the Linux VLM
 ====================================
 
-Requirements: x86_64 Linux, GCC, CMake 3.20 or newer, Make or Ninja, pthreads,
+Requirements: x86_64 Linux, GCC, CLISP, CMake 3.20 or newer, Make or Ninja, pthreads,
 libm, libdl, and development headers/libraries for X11, Xlib-xcb, and libcrypt.
-CLISP is needed only when regenerating the interpreter sources.
 
 Configure, build, and test:
 
@@ -41,21 +40,17 @@ Configuration options (pass -DNAME=VALUE to cmake -S . -B build):
     VLM_DEBUG_NETWORK_CHAOS  OFF: Chaos packet debugging
     VLM_DEBUG_NETWORK_ARP    OFF: ARP packet debugging
     VLM_DEBUG_NETWORK_ICMP   OFF: ICMP packet debugging (also enables IP)
-    VLM_REGENERATE_STUBS     OFF: use checked-in interpreter C sources
-    CLISP_EXECUTABLE         CLISP path, detected when regeneration is enabled
+    CLISP_EXECUTABLE         CLISP path, detected automatically (required)
 
 Protocol debugging requires VLM_DEBUG_NETWORK=ON. Debug builds use CMake's
 normal debug flags; VLM_FAST affects only Release and RelWithDebInfo.
 VLM_NATIVE=OFF is useful when distributing binaries to other x86_64 machines.
 GNU C99 and -fno-strict-aliasing are required by the existing emulator code.
 
-To develop the interpreter's assembler or Lisp macros:
-
-    cmake -S . -B build -DVLM_REGENERATE_STUBS=ON
-    cmake --build build --parallel
-
-CMake runs CLISP when the inputs change and puts generated instruction sources
-in build/stub, without modifying the checked-in copies. To generate without
+CMake generates the interpreter C sources from the Alpha assembler and Lisp
+macros as part of every build that needs them. It runs CLISP when the inputs
+change or outputs are missing, and puts generated instruction sources in
+build/stub. These files are not stored in the repository. To generate without
 compiling, use cmake --build build --target generate-stubs.
 
 Optional runtime integration test (requires Python 3, an X display, a free
